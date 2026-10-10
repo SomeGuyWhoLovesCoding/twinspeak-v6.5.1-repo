@@ -9,11 +9,30 @@ setlocal EnableExtensions
 set "INI=%~dp0twinspeak.ini"
 set "BAK=%~dp0twinspeak.ini.bak"
 
+echo.
 echo twinspeak v6.5.1 -- twinspeak.ini generator
 echo ============================================
-
+echo.
+echo What this script does:
+echo   [1/4] back up any existing twinspeak.ini to twinspeak.ini.bak
+echo   [2/4] write the tuned v6.5.1 twinspeak.ini next to this script
+echo         -- every line goes into the FILE, so the screen stays
+echo         quiet while all of them are written
+echo   [3/4] verify the written file, key by key
+echo   [4/4] print the summary
+echo.
+echo Tip: clicking inside a console window freezes its output until
+echo you press Enter once. That Enter belongs to the selection,
+echo not to this script -- nothing was lost.
+echo.
+echo [1/4] Checking for an existing twinspeak.ini ...
 if exist "%INI%" copy /y "%INI%" "%BAK%" >nul
+if exist "%INI%" echo       found one -- backed up to twinspeak.ini.bak
+if not exist "%INI%" echo       none found -- fresh install, nothing to back up.
 
+echo [2/4] Writing twinspeak.ini -- this step looks quiet on purpose:
+echo       every line goes into the file. It finishes in well under
+echo       a second.
 > "%INI%" echo ; twinspeak v6.5.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,
 >> "%INI%" echo ; out2 = center ONLY (every other channel muted), no resampler anywhere.
 >> "%INI%" echo.
@@ -275,9 +294,25 @@ if exist "%INI%" copy /y "%INI%" "%BAK%" >nul
 >> "%INI%" echo ; (out2_first): the center leg gets the freshest data and the most
 >> "%INI%" echo ; scheduling attention; delay1_ms/delay2_ms then trim the alignment.
 
-echo Done: twinspeak.ini written next to this script.
-echo If a previous twinspeak.ini existed, it was backed up to twinspeak.ini.bak.
-echo.
+if not exist "%INI%" echo       ERROR: twinspeak.ini was NOT written -- run this from a writable folder.
+if exist "%INI%" for /f %%N in ('find /c /v "" ^< "%INI%"') do set "LINES=%%N"
+if exist "%INI%" for %%A in ("%INI%") do set "BYTES=%%~zA"
+if exist "%INI%" echo       wrote %LINES% lines, %BYTES% bytes.
+if exist "%INI%" echo       Full path: %INI%
+
+echo [3/4] Verifying the written file, key by key ...
+set "VERIFY=ok"
+call :check "delay1_ms = 65"
+call :check "ks_period_frames = 96"
+call :check "ks_periods = 4"
+call :check "backend1 = wasapi"
+call :check "drift_guard = on"
+call :check "center_gate = on"
+call :check "keepalive_gain = 0.01"
+if "%VERIFY%"=="ok" echo       verification PASSED -- all sentinel keys present.
+if not "%VERIFY%"=="ok" echo       verification FAILED -- do NOT run twinspeak with this file.
+
+echo [4/4] Done.
 echo Replace the current twinspeak.ini so it works -- that is exactly what
 echo this script did: the generated file has REPLACED any previous ini.
 echo Keep twinspeak.exe in the same folder and run it.
@@ -287,5 +322,16 @@ echo The WDM-KS backend (backendN = ks), inspired by FlexASIO, is the
 echo low-latency option for pinned machines; it falls back to WASAPI
 echo automatically when a driver refuses the pin.
 echo.
-pause
+echo Press any key to close this window . . .
+pause >nul
 endlocal
+exit /b
+
+:check
+findstr /c:%1 "%INI%" >nul 2>&1
+if errorlevel 1 (
+    set "VERIFY=FAILED"
+    echo       MISSING: %~1
+)
+if not errorlevel 1 echo       ok: %~1
+goto :eof
