@@ -23,7 +23,7 @@ It exists for the machine that cannot do analog multichannel — a Lenovo M720q 
 ## Requirements
 
 * Windows 10/11 x64, and a 2013-or-newer CPU (Intel Haswell+, AMD Zen+ — the exe targets x86-64-v3/AVX2; rebuild without `-march` for anything older).
-* [VB-Audio Virtual Audio Cable](https://vb-audio.com/Cable/) installed as the 5.1 source target: **8 channels, 48000 Hz**, and the **WaveRT port driver** selected in the VAC Control Panel (a WaveCyclic port doubles the shared-mode capture clamp; WaveRT unlocks the real burst).
+* [VB-Audio Virtual Audio Cable](https://vb-audio.com/Cable/) (or muzychenko Virtual Audio Cable, paid) installed as the 5.1 source target: **8 channels, 48000 Hz**, and the **WaveRT port driver** selected in the VAC Control Panel (a WaveCyclic port doubles the shared-mode capture clamp; WaveRT unlocks the real burst).
 * Two output devices. The reference rig: onboard Realtek (mains) + Adesso Xtream S5 USB speakers (center). Any devices work — you match them by name substring.
 * A 5.1-capable source app that can address the cable.
 
