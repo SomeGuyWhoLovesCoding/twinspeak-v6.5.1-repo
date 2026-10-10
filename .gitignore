@@ -1,0 +1,9 @@
+# build artifacts
+twinspeak.exe
+*.obj
+*.o
+*.pdb
+
+# runtime output
+twinspeak.log
+twinspeak.ini.bak
