@@ -1,5 +1,61 @@
 // ============================================================================
-//  twinspeak v6.5.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.3 (field directive: "how optimized is this, actually? ... I want to
+//          also ensure it runs on the last two threads of my cpu, same going
+//          with audiodg.exe which I have modified affinity and priority
+//          properties of on process lasso." -- the realtime internals were
+//          already RT-grade (MMCSS 'Pro Audio' + time-critical pumps and
+//          device threads, FTZ/DAZ, high-res waitable timers, lock-free CAS
+//          rings, -O3 -march=x86-64-v3 with FMA fusion disabled); what was
+//          MISSING is CPU PLACEMENT: the scheduler was free to roam all
+//          ~8 threads across all cores, colliding with desktop/DPC churn
+//          and going cache-cold on every migration. Two new ini keys:
+//
+//    cpu_affinity  pin EVERY thread to a fixed CPU set (last:N / "4,5" /
+//                  "4-5" / 0x30 masks), process-wide BEFORE any audio
+//                  thread exists so everything inherits. Paired with a
+//                  Process Lasso rule for audiodg.exe, the whole audio
+//                  chain lives on the same dedicated cores.
+//    priority      raise the PROCESS class (normal/above_normal/high/
+//                  realtime). The audio threads were already time-
+//                  critical; 'high' lifts the rest of the process (health
+//                  loop, watchers, reopen logic) to match. One interaction
+//                  handled: in the HIGH class HIGHEST == TIME_CRITICAL ==
+//                  15, which would erase the out2_first notch -- there the
+//                  mains pump takes ABOVE_NORMAL instead. Defaults: off
+//                  (exact v6.5.2 behavior). Banner reports both.
+//
+//  v6.5.2 (field report: "It eventually starts acting up whenever I let my
+//          computer sleep" + a 4-hour health log from the M720Q. The log
+//          catches the whole failure: the moment the machine degrades into
+//          sleep, the S5's stream stops consuming at the real rate -- first
+//          small excess drops (288/576 fr), then the break: leg2's device
+//          thread kept ticking but consumed at ~42% of the cable's rate
+//          (off +1,345,794 ppm), the out2 ring stuffed to 85 ms, ~572 ms/s
+//          passively evicted, gated drops + warden re-pins fighting a
+//          limit cycle they can never win. The heartbeat watchdog is
+//          STRUCTURALLY BLIND here: the callback thread never went silent,
+//          so nothing reopened the leg. The engine is faultless while
+//          devices behave; nothing in it handled a half-alive device.
+//          The fix -- the POWER GUARD (power_guard = on, default):
+//
+//    1. WM_POWERBROADCAST on a hidden top-level window (a message-only
+//       HWND would never receive broadcasts): PBT_APMSUSPEND parks the
+//       pumps -- no more data into a device the OS is taking away -- and
+//       suppresses the watchdog (no reopen storms mid-suspend). The
+//       resume pair clears the park and the health loop rebuilds the
+//       capture pin + BOTH legs from scratch, replays the chime, and
+//       resets the warden/hint state. A post-sleep stream is never
+//       trusted again.
+//    2. A consumption-collapse sentinel: a healthy 48 kHz link never
+//       leaves +-10% (the same log's worst HEALTHY wobble was +-4000
+//       ppm). Two consecutive 1-s windows beyond that and the leg is
+//       reopened fresh -- this catches the degraded sleep-ENTRY window,
+//       which fires BEFORE the suspend broadcast, plus any driver reset
+//       that leaves a thread ticking at a bogus rate. With both layers,
+//       the worst case across any sleep is one fresh reopen on wake
+//       instead of a permanently glitching path.
 //
 //  v6.5.1 (field report: "I found that my delay between speakers are ~65ms"
 //          -- that number was read off the health line's 'drift' column while
@@ -832,6 +888,19 @@ struct Config {
     // observes); drift_guard switches the automatic re-pin on top of it.
     bool        driftGuard     = true;   // auto re-pin at >= drift_correct_ms
     float       driftCorrectMs = 10.0f;  // trigger distance from the baseline (ms)
+    // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
+    // the pumps; resume rebuilds capture + both legs; a sentinel reopens
+    // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
+    // stream ticks at a bogus rate with a FRESH heartbeat -- the silence
+    // watchdog cannot see it). off = exact v6.5.1 behavior.
+    bool        powerGuard     = true;
+    // v6.5.3 CPU placement: pin every thread to a fixed set of logical CPUs
+    // and optionally raise the process priority class. Raw ini strings here;
+    // applyCpuPlacement() resolves + applies them in main() BEFORE any audio
+    // thread exists, so every thread inherits. Empty = off (v6.5.2 behavior:
+    // the OS scheduler places all threads wherever it likes).
+    std::string cpuAffinity    = "";   // "", "last:N", "4,5", "4-5", "0x30"
+    std::string priority       = "";   // "", "normal", "above_normal", "high", "realtime"
 };
 static Config g_cfg;
 
@@ -1388,6 +1457,51 @@ static DWORD WINAPI volumeWatchThread(LPVOID) {
     return 0;
 }
 
+// --------------------------------------------------- v6.5.2 POWER GUARD ----
+// The adaptive-power layer. g_powerPark is read by the pumps and the
+// health loop; the window thread only logs and flips flags -- every
+// reopen stays on the health-loop thread that owns the devices.
+static std::atomic<bool> g_powerPark{false};    // PBT_APMSUSPEND: pumps idle
+static std::atomic<bool> g_powerWoken{false};   // resume: health loop rebuilds
+static constexpr long kCollapsePpm = 100000;    // +-10%: 25x the worst healthy
+                                                // wobble seen in the field log
+
+static LRESULT CALLBACK powerWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    (void)w; (void)lp;
+    if (m == WM_POWERBROADCAST) {
+        if (wp == PBT_APMSUSPEND) {
+            if (!g_powerPark.exchange(true))
+                tlog("[twinspeak] power guard : system suspend -- parking the pumps (audio resumes on wake)\n");
+        } else if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+            // RESUMESUSPEND trails RESUMEAUTOMATIC on user-initiated
+            // wakes; the health loop consumes the flag once, so raising
+            // it twice is harmless.
+            g_powerPark.store(false, std::memory_order_relaxed);
+            g_powerWoken.store(true, std::memory_order_relaxed);
+        }
+        return TRUE;
+    }
+    return DefWindowProcW(w, m, wp, lp);
+}
+
+static DWORD WINAPI powerThread(LPVOID) {
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = powerWndProc;
+    wc.lpszClassName = L"twinspeak_power_guard";
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    if (!RegisterClassExW(&wc)) return 0;
+    // style 0 = never visible; a NORMAL top-level window so broadcast
+    // WM_POWERBROADCAST reaches it (message-only windows get nothing).
+    HWND w = CreateWindowExW(0, wc.lpszClassName, L"", 0,
+                             0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!w) return 0;
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+    return 0;
+}
+
 // ------------------------------------------------------------- callbacks ----
 // capture callback: dumb fan-out. The less work happens here, the better --
 // each pump thread does its own leg's mixing, on its own thread, in parallel.
@@ -1790,8 +1904,15 @@ static DWORD WINAPI pumpThread(LPVOID p) {
     // most attention"). The movers are trivial memcpy work; leg1's deeper
     // raw ring absorbs any scheduling deference. Device threads stay equal:
     // both are deadline-bound and must never be ranked against each other.
-    if (idx == 0 && g_cfg.out2First)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    if (idx == 0 && g_cfg.out2First) {
+        // v6.5.3: keep the notch real in EVERY process class. HIGHEST sits
+        // below TIME_CRITICAL in NORMAL (10 vs 15) and REALTIME (26 vs 31),
+        // but in the HIGH class both map to 15 -- there the mains pump takes
+        // ABOVE_NORMAL (11) so the center leg keeps its scheduling edge.
+        SetThreadPriority(GetCurrentThread(),
+            GetPriorityClass(GetCurrentProcess()) == HIGH_PRIORITY_CLASS
+                ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_HIGHEST);
+    }
 
     // SYNCHRONIZATION timer (no MANUAL_RESET flag!). A manual-reset timer
     // stays signaled after its first expiry -- WaitForSingleObject does not
@@ -1817,6 +1938,11 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         if (timerOK) WaitForSingleObject(hTimer, 50);
         else         Sleep(1);
         if (!g_run.load()) break;
+        // v6.5.2: PBT_APMSUSPEND park -- the OS is taking the devices;
+        // stop feeding the out rings. The raw ring overflows harmlessly
+        // (capture-side evictions are counted in 'drop' and the sequence
+        // ledger advances with them); a rebuild follows on resume.
+        if (g_powerPark.load(std::memory_order_relaxed)) continue;
 
         // drain raw -> master volume -> mute/mix -> out ring (push all).
         // The ring headroom absorbs the normal pop/burst sawtooth; real
@@ -2626,7 +2752,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2843,6 +2969,34 @@ static void writeTemplate(const char* path) {
         "drift_guard = on\n"
         "drift_correct_ms = 10\n"
         "\n"
+        "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
+        "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
+        "; cable's rate with a FRESH heartbeat -- the silence watchdog is blind\n"
+        "; to that, and the path glitched forever in a drop/re-pin limit cycle.\n"
+        "; With the guard ON: suspend parks the pumps; resume rebuilds the\n"
+        "; capture pin + both legs (and replays the startup chime); any leg\n"
+        "; whose measured clock offset ('off') leaves +-10%% for 2 s is reopened\n"
+        "; fresh -- that catches the degraded sleep-ENTRY window too, which\n"
+        "; fires before the suspend broadcast. Every action is logged.\n"
+        "power_guard = on\n"
+        "\n"
+        "; CPU PLACEMENT (v6.5.3) -- pin every twinspeak thread to a fixed set of\n"
+        "; logical CPUs (0-based, as Task Manager numbers them) instead of letting\n"
+        "; the scheduler roam all cores. Pair this with your Process Lasso rule for\n"
+        "; audiodg.exe and the whole audio chain lives on the same dedicated cores,\n"
+        "; away from the desktop/DPC churn on the first ones.\n"
+        ";   last:2     the LAST two logical CPUs (a 6-thread i5-8400: CPUs 4-5)\n"
+        ";   4,5 / 4-5  an explicit list / an inclusive range (0-based)\n"
+        ";   0x30       a raw affinity mask\n"
+        ";   off        the OS scheduler decides (v6.5.2 behavior)\n"
+        "; priority raises the PROCESS class: normal | above_normal | high |\n"
+        "; realtime. The audio threads already run MMCSS 'Pro Audio' + time-\n"
+        "; critical on their own -- 'high' lifts the REST of the process (health\n"
+        "; loop, watchers, reopen logic) to match. realtime is overkill and can\n"
+        "; starve the USB stack: 'high' is the right class here.\n"
+        "cpu_affinity = last:2\n"
+        "priority = high\n"
+        "\n"
         "; CENTER PRESENCE (v6.1) -- out2 plays the center channel ONLY while it\n"
         "; is genuinely present. Two gates, both default ON:\n"
         ";   center_gate -- a block whose ch3 is digital zero emits NOTHING but\n"
@@ -2938,6 +3092,9 @@ static bool loadIni(const char* path) {
         else if (key == "ks_periods")      g_cfg.ksPeriods      = (unsigned)atoi(val.c_str()); // v6.3
         else if (key == "drift_guard")      g_cfg.driftGuard     = !isOff(val);  // v6.4
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
+        else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
+        else if (key == "cpu_affinity")     g_cfg.cpuAffinity    = lower(val);   // v6.5.3
+        else if (key == "priority")         g_cfg.priority       = lower(val);   // v6.5.3
     }
     fclose(f);
     // legacy fallback: buffer_size applies to any leg without an explicit outXms
@@ -3231,6 +3388,148 @@ static void printLegDevice(int idx) {
 // ---------------------------------------------------------------- main ------
 static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
 
+// --------------------------------------------------- v6.5.3 CPU PLACEMENT --
+// Resolve cpu_affinity / priority AFTER the ini parse and BEFORE any audio
+// thread exists (called from main right after timeBeginPeriod): the affinity
+// mask and the priority class are process-wide state that every later
+// CreateThread inherits. Deliberately SILENT -- tlog output here would land
+// on a console that background mode is about to detach; the banner reports
+// exactly what was applied, and why anything was refused.
+static std::string g_affinityDesc = "off -- the OS scheduler places all threads (cpu_affinity unset)";
+static std::string g_priorityDesc = "off -- process class stays NORMAL (threads keep their own MMCSS/time-critical boosts)";
+
+// "4-5" from a contiguous run of bits, "0,3,5" from scattered ones.
+static std::string maskToCpuList(unsigned long long m) {
+    std::string s;
+    char buf[24];
+    int runStart = -1;
+    for (int i = 0; i <= 64; ++i) {
+        const bool bit = (i < 64) && ((m >> i) & 1ULL);
+        if (bit && runStart < 0) runStart = i;
+        if (!bit && runStart >= 0) {
+            if (!s.empty()) s += ",";
+            if (i - 1 > runStart) { snprintf(buf, sizeof buf, "%d-%d", runStart, i - 1); s += buf; }
+            else                  { snprintf(buf, sizeof buf, "%d", runStart);           s += buf; }
+            runStart = -1;
+        }
+    }
+    return s;
+}
+
+// One CPU index, 0-based ("as Task Manager numbers them"). A CPU the process
+// is not allowed to use is skipped and flagged, not an error.
+static bool addCpuIndex(const std::string& tok, unsigned long long sysMask,
+                        unsigned long long& want, bool& clamped) {
+    if (tok.empty()) return false;
+    char* endp = nullptr;
+    const long idx = strtol(tok.c_str(), &endp, 10);
+    if (!endp || *endp != '\0' || idx < 0 || idx > 63) return false;
+    const unsigned long long bit = 1ULL << idx;
+    if (!(sysMask & bit)) { clamped = true; return true; }
+    want |= bit;
+    return true;
+}
+
+static void applyCpuPlacement() {
+    unsigned long long sysMask = 0, procMask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), (PDWORD_PTR)&procMask, (PDWORD_PTR)&sysMask)
+        || !sysMask)
+        sysMask = procMask ? procMask : 0xFFFFULL;
+
+    // ---- cpu_affinity: every thread this process ever spawns inherits ----
+    const std::string& a = g_cfg.cpuAffinity;
+    if (!a.empty() && a != "off") {
+        unsigned long long want = 0, asked = 0;
+        bool ok = true, clamped = false;
+        std::string why;
+        if (a.rfind("last:", 0) == 0) {
+            const int n = atoi(a.c_str() + 5);
+            if (n <= 0) { ok = false; why = "last:N needs N >= 1"; }
+            else {
+                int left = n;
+                for (int i = 63; i >= 0 && left > 0; --i)
+                    if ((sysMask >> i) & 1ULL) { want |= (1ULL << i); --left; }
+                if (left > 0) clamped = true;   // asked for more CPUs than exist
+            }
+        } else if (a.rfind("0x", 0) == 0 || a.rfind("0X", 0) == 0) {
+            asked = strtoull(a.c_str(), nullptr, 16);
+            want  = asked & sysMask;
+            if (!want)      { ok = false; why = "mask names no usable CPU"; }
+            else if (want != asked) clamped = true;
+        } else if (a.find(',') != std::string::npos) {
+            size_t pos = 0;
+            while (pos <= a.size()) {
+                size_t comma = a.find(',', pos);
+                if (comma == std::string::npos) comma = a.size();
+                const std::string tok = a.substr(pos, comma - pos);
+                if (!addCpuIndex(tok, sysMask, want, clamped)) {
+                    ok = false; why = "bad CPU index '" + tok + "'"; break;
+                }
+                pos = comma + 1;
+            }
+            if (ok && !want) { ok = false; why = "no usable CPU in the list"; }
+        } else if (a.find('-') != std::string::npos) {
+            const size_t dash = a.find('-');
+            const int lo = atoi(a.substr(0, dash).c_str());
+            const int hi = atoi(a.substr(dash + 1).c_str());
+            if (lo < 0 || hi > 63 || lo > hi) { ok = false; why = "range needs 0 <= lo <= hi <= 63"; }
+            else for (int i = lo; i <= hi; ++i) {
+                const unsigned long long bit = 1ULL << i;
+                if (sysMask & bit) want |= bit; else clamped = true;
+            }
+        } else {
+            if (!addCpuIndex(a, sysMask, want, clamped)) {
+                ok = false; why = "single 0-based CPU index expected (e.g. 4)";
+            } else if (!want) {
+                ok = false; why = "that CPU is not available to this process";
+            }
+        }
+        if (ok && want) {
+            char maskTxt[24];
+            snprintf(maskTxt, sizeof maskTxt, "0x%llX", want);
+            if (SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)want)) {
+                std::string d = "pinned to CPU" + maskToCpuList(want) + " (mask "
+                              + maskTxt + ") -- every thread inherits";
+                if (clamped) d += "; clamped to this system's usable CPUs";
+                g_affinityDesc = d;
+            } else {
+                g_affinityDesc = "SetProcessAffinityMask refused ("
+                               + maskToCpuList(want) + ") -- staying unpinned";
+            }
+        } else if (!ok) {
+            g_affinityDesc = "UNRECOGNIZED cpu_affinity '" + a + "' -- off (" + why
+                           + "; forms: last:N | 4,5 | 4-5 | 0x30 | off)";
+        }
+    }
+
+    // ---- priority: the PROCESS class behind the threads' own boosts ----
+    const std::string& pr = g_cfg.priority;
+    if (!pr.empty() && pr != "off") {
+        DWORD cls = 0;
+        if      (pr == "normal")       cls = NORMAL_PRIORITY_CLASS;
+        else if (pr == "above_normal") cls = ABOVE_NORMAL_PRIORITY_CLASS;
+        else if (pr == "high")         cls = HIGH_PRIORITY_CLASS;
+        else if (pr == "realtime")     cls = REALTIME_PRIORITY_CLASS;
+        if (!cls) {
+            g_priorityDesc = "UNRECOGNIZED priority '" + pr
+                           + "' -- staying NORMAL (forms: normal | above_normal | high | realtime | off)";
+        } else if (!SetPriorityClass(GetCurrentProcess(), cls)) {
+            g_priorityDesc = "SetPriorityClass refused -- staying NORMAL";
+        } else if (cls == HIGH_PRIORITY_CLASS) {
+            g_priorityDesc = "HIGH process class -- lifts the non-audio threads (health loop,\n"
+                             "                            watchers, reopen logic); the audio threads already run\n"
+                             "                            MMCSS 'Pro Audio' + time-critical on their own";
+        } else if (cls == REALTIME_PRIORITY_CLASS) {
+            g_priorityDesc = "REALTIME process class -- CAREFUL: this can starve the USB stack,\n"
+                             "                            input and networking; 'high' is the sane class for audio";
+        } else if (cls == ABOVE_NORMAL_PRIORITY_CLASS) {
+            g_priorityDesc = "ABOVE_NORMAL process class";
+        } else {
+            g_priorityDesc = "NORMAL process class";
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
     std::string iniPath;
@@ -3288,6 +3587,7 @@ int main(int argc, char** argv) {
     }
 
     timeBeginPeriod(1);
+    applyCpuPlacement();               // v6.5.3: affinity + priority class BEFORE any thread spawns
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
     g_bootMs = GetTickCount64();           // v3.8 watchdog grace timer
     {                                      // v6.4: lag display clock anchors
@@ -3638,6 +3938,14 @@ int main(int argc, char** argv) {
     HANDLE hWatch = (g_cfg.volumeFollow || g_cfg.pinOutputs)
                   ? CreateThread(nullptr, 0, volumeWatchThread, nullptr, 0, nullptr)
                   : nullptr;
+    // v6.5.2 power guard: the WM_POWERBROADCAST listener must exist before
+    // the health loop starts -- a sleep landing right after start is still
+    // caught. The thread only flips flags; every reopen stays on the
+    // health-loop thread that owns the devices.
+    HANDLE hPower = g_cfg.powerGuard
+                  ? CreateThread(nullptr, 0, powerThread, nullptr, 0, nullptr)
+                  : nullptr;
+    (void)hPower;
 
     // v6.2 BACKGROUND: detach BEFORE the banner -- a failure above already
     // returned with the console intact and the reason on screen; from here
@@ -3669,7 +3977,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.1         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.3         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -3700,6 +4008,13 @@ int main(int argc, char** argv) {
            "                            FIFO) -- a flat drift column with audible drift = device silicon, and this\n"
            "                            log proves it.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
+    tlog("[twinspeak] power guard   : %s -- suspend parks the pumps, resume rebuilds capture + both\n"
+           "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
+           "                            fresh. The v6.5.1 field log: an S5 came back from sleep at ~42%%\n"
+           "                            consumption with a fresh heartbeat and glitched forever.\n",
+           g_cfg.powerGuard ? "ON" : "OFF (power_guard = off -- v6.5.1 behavior)");
+    tlog("[twinspeak] cpu placement : %s\n", g_affinityDesc.c_str());
+    tlog("[twinspeak] priority      : %s\n", g_priorityDesc.c_str());
     tlog("[twinspeak] leg1 (mains)   : \"%s\" | %s | period %u ms x2\n",
            n1.c_str(),
            g_leg[0].backend == 1 ? "WDM-KS (kernel streaming)" :
@@ -3826,6 +4141,8 @@ int main(int argc, char** argv) {
     unsigned long long m00 = 0;                          // cumulative upmix-guard blocks
     unsigned long long q00 = 0, q10 = 0;                 // cumulative warden-pad counters (v6.4)
     long off0 = 0, off1 = 0;
+    int colStreak0 = 0, colStreak1 = 0;                  // v6.5.2 collapse sentinel
+    unsigned long long colLastMs[2] = { 0, 0 };          // per-leg reopen cooldown
     bool ccHintDone = false;
     // v6.4 drift warden state (health-loop owned)
     double driftBase = 0.0;                              // calibrated inter-speaker offset
@@ -3921,10 +4238,61 @@ int main(int argc, char** argv) {
         // reset). Reopen it by name; retry every tick until it returns.
         // Out2 is checked first (start-order symmetry).
         const unsigned long long nowMs = GetTickCount64();
-        if (nowMs - g_bootMs > 3000) {
+        // v6.5.2: while parked (suspend in flight) the heartbeats go stale
+        // by definition -- do NOT storm reopen attempts at a device the OS
+        // is putting to sleep; the resume path rebuilds everything.
+        if (nowMs - g_bootMs > 3000 && !g_powerPark.load(std::memory_order_relaxed)) {
             if (nowMs - hbOutGet(1) > 5000) tryRestartLeg(1, &ctx, periodMs2);
             if (nowMs - hbOutGet(0) > 5000) tryRestartLeg(0, &ctx, periodMs1);
             if (nowMs - g_hbCap.load(std::memory_order_relaxed) > 5000) tryRestartCap(&ctx);
+        }
+        // ---- v6.5.2 power guard: resume rebuild + collapse sentinel ----
+        if (g_cfg.powerGuard && g_powerWoken.exchange(false)) {
+            g_powerPark.store(false, std::memory_order_relaxed);
+            tlog("[twinspeak] power guard : system resume -- rebuilding capture + both legs\n"
+                 "                            (a post-sleep stream is never trusted: the field log\n"
+                 "                            shows an S5 consuming at ~42%% with a fresh heartbeat)\n");
+            tryRestartCap(&ctx);
+            tryRestartLeg(1, &ctx, periodMs2);   // center first -- out2_first symmetry
+            tryRestartLeg(0, &ctx, periodMs1);
+            wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
+            colStreak0 = 0; colStreak1 = 0;
+        }
+        // CONSUMPTION-COLLAPSE SENTINEL: |off| beyond +-10% for 2 consecutive
+        // 1-s windows is physically impossible for a healthy 48 kHz link. A
+        // half-alive post-sleep stream ticks at a fraction of the real rate
+        // with a FRESH heartbeat -- only this meter can see it. Also catches
+        // the degraded sleep-ENTRY window (it fires before the broadcast)
+        // and any driver reset that leaves a bogus-rate thread running.
+        if (g_cfg.powerGuard && !g_powerPark.load(std::memory_order_relaxed)
+            && nowMs - g_bootMs > 30000) {
+            colStreak0 = (off0 > kCollapsePpm || off0 < -kCollapsePpm) ? colStreak0 + 1 : 0;
+            colStreak1 = (off1 > kCollapsePpm || off1 < -kCollapsePpm) ? colStreak1 + 1 : 0;
+            if (colStreak0 >= 2 || colStreak1 >= 2) {
+                const int li = (colStreak0 >= 2) ? 0 : 1;
+                const long bad = (li == 0) ? off0 : off1;
+                Leg& SL = g_leg[li];
+                if (nowMs - SL.lastReopenMs > 5000 && nowMs - colLastMs[li] >= 10000) {
+                    colLastMs[li] = nowMs;
+                    colStreak0 = 0; colStreak1 = 0;
+                    if (bad > 0) {
+                        // positive = the DEVICE under-consumed (captured more
+                        // than it popped) -- the field log's half-alive S5.
+                        tlog("[twinspeak] power guard : leg%d consuming at %+ld ppm -- stream broken\n"
+                             "                            (sleep resume, driver reset?) -- reopening fresh\n",
+                             li + 1, bad);
+                        tryRestartLeg(li, &ctx, li == 0 ? periodMs1 : periodMs2);
+                    } else {
+                        // negative = the leg asked for frames the CAPTURE side
+                        // never delivered -- rebuilding the leg cannot fix a
+                        // starved ring; the capture pin gets rebuilt instead.
+                        tlog("[twinspeak] power guard : leg%d starved (%+ld ppm) -- the capture side\n"
+                             "                            stopped feeding it -- rebuilding the capture pin\n",
+                             li + 1, bad);
+                        tryRestartCap(&ctx);
+                    }
+                }
+            }
         }
         // ---------------- v6.4 DRIFT WARDEN ----------------
         // Baseline: the settled path's average drift (seconds 8..15, both

@@ -1,3 +1,102 @@
+twinspeak v6.5.3 -- the CPU PLACEMENT build
+==========================================
+
+What changed in v6.5.3 (pin the engine to your audio cores)
+-----------------------------------------------------------
+Field directive: "how optimized is this, actually? ... I want to also ensure
+it runs on the last two threads of my cpu, same going with audiodg.exe which
+I have modified affinity and priority properties of on process lasso."
+
+The honest audit first: the realtime internals were already there -- MMCSS
+"Pro Audio" registration + THREAD_PRIORITY_TIME_CRITICAL on every pump and
+device thread (v3.8), FTZ/DAZ denormal guards on every realtime thread
+(v6.5), high-resolution waitable timers with a deliberate YieldProcessor
+spin only at the KS deadline, lock-free CAS rings with wrap-aware bulk
+memcpys (v6.5), and -O3 -march=x86-64-v3 with -ffp-contract=off so nothing
+can bend the bit-exact path. What was missing: CPU PLACEMENT. The Windows
+scheduler was free to roam all ~8 threads across all cores -- racing the
+desktop's threads and DPCs, going cache-cold on every migration, and
+sharing the core that hosts the KS deadline spin with anything Windows
+decided to run there.
+
+The fix is two ini keys, applied in main() BEFORE any audio thread exists:
+
+1. cpu_affinity -- SetProcessAffinityMask for the whole process. Accepted:
+   last:N (the N highest logical CPUs; last:2 on a 6-thread i5-8400 = CPUs
+   4-5, mask 0x30), explicit lists "4,5", inclusive ranges "4-5", raw masks
+   "0x30", or off. Requested CPUs outside the system affinity are clamped
+   and the banner says so. Default: off (exact v6.5.2 behavior).
+2. priority -- SetPriorityClass: normal / above_normal / high / realtime /
+   off. The audio threads were already time-critical on their own; high
+   lifts the REST of the process (health loop, watchers, reopen logic).
+   One interaction handled: in the HIGH class HIGHEST == TIME_CRITICAL ==
+   15, which would have silently ERASED the out2_first notch -- so in that
+   class the mains pump takes ABOVE_NORMAL (11) instead. REALTIME prints a
+   caution: it can starve the USB stack; high is the sane class here.
+
+The shipped twinspeak.ini sets cpu_affinity = last:2 + priority = high
+(audiodg.exe via Process Lasso on the same two cores = the whole audio
+chain on dedicated silicon). The banner reports both on every start
+("cpu placement :" / "priority :" lines). generate_ini.bat does not emit
+these keys (the default -- off -- covers any ini without them).
+
+Build recipe unchanged (v6.5 flags): -O3 -ffp-contract=off -std=c++17
+-march=x86-64-v3, zero warnings.
+
+
+twinspeak v6.5.2 -- the POWER GUARD build
+=========================================
+
+What changed in v6.5.2 (sleep / Modern-Standby survival)
+--------------------------------------------------------
+Field report: "It eventually starts acting up whenever I let my computer
+sleep" + a 4-hour health log from the M720Q. The log catches the whole
+failure:
+
+  line ~1345 : first excess drops (288 fr, then 576 fr) -- the machine is
+               degrading into sleep; the S5 stops consuming at the real rate
+  line ~1433 : the break. leg2's device thread KEEPS TICKING but consumes at
+               ~42% of the cable's rate (off +1,345,794 ppm). The out2 ring
+               stuffs to 85 ms, ~572 ms/s is passively evicted (drop
+               +27456/s), and the gated drop + the drift warden fight a
+               limit cycle they can never win. out1 (Realtek) is flawless
+               through all of it -- the damage is exclusively the USB leg.
+  the tail   : hours of audible glitching; the heartbeat watchdog is
+               STRUCTURALLY BLIND because the callback thread never went
+               silent, so nothing ever reopened the leg.
+
+v6.5.1 was faultless while devices behave; nothing in it handled a
+half-alive device. The fix is the POWER GUARD (power_guard = on, default):
+
+1. WM_POWERBROADCAST on a hidden top-level window (a message-only HWND
+   would never receive broadcasts). PBT_APMSUSPEND parks the pumps -- no
+   more data into a device the OS is taking away -- and suppresses the
+   watchdog (no reopen storms mid-suspend). The resume pair (RESUMEAUTOMATIC
+   / RESUMESUSPEND) clears the park; the health loop then rebuilds the
+   capture pin AND BOTH LEGS from scratch, replays the startup chime, and
+   resets the warden/hint state. A post-sleep stream is never trusted.
+
+2. A consumption-collapse sentinel: a healthy 48 kHz link never leaves
+   +-10% (the same log's worst HEALTHY wobble was +-4000 ppm). Two
+   consecutive 1-s windows beyond that triggers a fix, branched by sign
+   (per-leg 10 s cooldown, 30 s boot grace): a POSITIVE collapse -- the
+   device under-consumed, the field log's half-alive S5 -- reopens that
+   leg fresh; a NEGATIVE collapse -- the leg asked for frames the capture
+   never delivered -- rebuilds the capture pin instead. This catches the
+   degraded sleep-ENTRY window (which fires BEFORE the suspend broadcast),
+   the half-alive post-wake stream, and any driver reset that leaves a
+   thread ticking at a bogus rate.
+
+With both layers the worst case across any sleep is one fresh reopen on
+wake plus the chime -- instead of a permanently glitching path. Every
+action is logged as "power guard :". power_guard = off restores exact
+v6.5.1 behavior.
+
+Notes: generate_ini.bat does not yet emit power_guard; the key defaults to
+on, so bat-generated configs get the guard anyway. No audio-path, ledger,
+or rule change of any kind -- the guard only adds reopen/park triggers on
+top of the v6.5.1 engine.
+
 twinspeak v6.5.1 -- the BIT-EXACT ASIO-strict build
 ==================================================
 
@@ -450,3 +549,22 @@ layer is an original implementation of the public KS/WaveRT property
 interface (KSCATEGORY_RENDER, KsCreatePin, KSPROPERTY_RTAUDIO_BUFFER /
 POSITIONREGISTER), following the same wire layout as the reference
 WDM-KS backends.
+
+generate_ini.bat -- interactive config generator (repo tooling note)
+-------------------------------------------------------------------
+The ini generator now works in PROMPTS, not arguments. It asks for the
+twelve keys that get tuned on this rig -- input_device, output_device1/2,
+backend1/2, ks_period_frames, ks_periods, delay1_ms, delay2_ms,
+drift_guard, keepalive_gain, background -- and every prompt shows its
+tuned default in [brackets]: pressing Enter keeps the default, typing a
+value overrides it. Holding Enter from the top accepts every default and
+reproduces the tuned twinspeak.ini byte-for-byte. A refused answer (cmd
+metacharacters, a non-number in a number field, an on/off or
+wasapi/ks typo) is announced and falls back to the default BEFORE
+anything is written, so a bad answer never touches the current ini. An
+advanced key=value prompt at the end of step 1 can override ANY ini key,
+spaces included (volume_endpoint=Line 1 (VAC)). The five-step narration
+(backup -- quiet write with line/byte report -- key-by-key verification
+-- summary of your changes) is unchanged. The earlier key=value
+command-line interface is gone; run the bat with no arguments and answer
+the prompts.

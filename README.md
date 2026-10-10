@@ -1,4 +1,4 @@
-# twinspeak v6.5.1
+# twinspeak v6.5.3
 
 **Bit-exact 5.1 → 2.1 + center splitter for Windows — WASAPI / WDM-KS, no resampler, no clones, no surprises.**
 
@@ -23,14 +23,18 @@ It exists for the machine that cannot do analog multichannel — a Lenovo M720q 
 ## Requirements
 
 * Windows 10/11 x64, and a 2013-or-newer CPU (Intel Haswell+, AMD Zen+ — the exe targets x86-64-v3/AVX2; rebuild without `-march` for anything older).
-* [VB-Audio Virtual Audio Cable](https://vb-audio.com/Cable/) (or muzychenko Virtual Audio Cable, paid) installed as the 5.1 source target: **8 channels, 48000 Hz**, and the **WaveRT port driver** selected in the VAC Control Panel (a WaveCyclic port doubles the shared-mode capture clamp; WaveRT unlocks the real burst).
+* [VB-Audio Virtual Audio Cable](https://vb-audio.com/Cable/) installed as the 5.1 source target: **8 channels, 48000 Hz**, and the **WaveRT port driver** selected in the VAC Control Panel (a WaveCyclic port doubles the shared-mode capture clamp; WaveRT unlocks the real burst).
 * Two output devices. The reference rig: onboard Realtek (mains) + Adesso Xtream S5 USB speakers (center). Any devices work — you match them by name substring.
 * A 5.1-capable source app that can address the cable.
 
 ## Quick start
 
 1. Put `twinspeak.exe` (from Releases) in its own folder.
-2. Put `generate_ini.bat` in the same folder and run it. **Replace the current twinspeak.ini so it works — that is exactly what the script does:** it writes the tuned, known-good v6.5.1 configuration and backs up any previous ini to `twinspeak.ini.bak`. (Running `twinspeak.exe` with no ini at all writes a generic template and exits — the generated one is the tuned config instead.)
+2. Put `generate_ini.bat` in the same folder and run it (double-click works too). **Replace the current twinspeak.ini so it works — that is exactly what the script does:** it writes the tuned, known-good v6.5.1 configuration and backs up any previous ini to `twinspeak.ini.bak`. (Running `twinspeak.exe` with no ini at all writes a generic template and exits — the generated one is the tuned config instead.)
+
+   The script is **interactive**: it asks for the twelve keys that actually get tuned on this rig — devices, KS transport, alignment delays, guards — and every prompt shows its tuned default in `[brackets]`. **Press Enter to keep the default; type a value first to override it.** Holding Enter from the top accepts every default and reproduces the tuned ini byte-for-byte. A refused answer (cmd metacharacters, non-number in a number field, `on`/`off` typo, empty value) is announced and falls back to the default **before anything is written** — a bad answer never touches your current ini. An advanced `key=value` prompt at the end of step 1 can override *any* ini key, spaces included (`volume_endpoint=Line 1 (VAC)`).
+
+   The script narrates five numbered steps: **[1/5]** your settings (12 prompts + the advanced `key=value` prompt; each accepted override is echoed), **[2/5]** backup (it says whether one was made), **[3/5]** the write — a deliberately *quiet* step, because all ~260 lines go into the file, not onto the screen (it then reports lines + bytes + full path), **[4/5]** a key-by-key verification of the written file against the values just chosen (`ok: …` per key, `MISSING: …` if anything went wrong, with a PASSED/FAILED verdict), **[5/5]** the summary — every prompt you changed is listed with its tuned default beside it. It then waits for a keypress so the window stays open. Windows tip: clicking inside a console window freezes its output (text-select mode) until you press Enter — if a step ever looks stuck, press Enter once and the log resumes; nothing was lost.
 3. Check the device needles against your hardware: `twinspeak --list` (WASAPI endpoints) and `twinspeak --list-ks` (kernel filters). Edit `input_device`, `output_device1`, `output_device2` if yours differ.
 4. Run `twinspeak.exe`. Read the banner: route map, negotiated periods per leg, each leg's `est path`, and the align line.
 5. Watch the health line: `off` near 0 ppm, `und +0/0`, `drop +0/0`, `corr 0/0`, `cm +0`.
@@ -77,6 +81,26 @@ Every capture burst is stamped into a frame-interval ledger. Each leg tracks the
 * A drift that leaves the baseline by >= `drift_correct_ms` (default 10, clamped 2..500) for 3 consecutive seconds is corrected automatically, at most once per 30 s: the late leg's ring gives back its excess (a bit-exact skip) and the early leg is held (its last buffer replays in place). No sample value is ever touched.
 * **Honest limits, written into the log:** the ledger sees the HOST pipeline only — anything below the USB packetizer (a USB speaker's own receiver FIFO / amp silicon) is invisible. If `drift` stays flat while your ears hear drift, the offset is device silicon and no host trigger exists — the log proves exactly that. A correction is a skip or a stutter of at most `drift_correct_ms` (rate-limited).
 * `drift_guard = off` keeps the ledger and the columns but disables the automatic re-pin (observe-only).
+
+## Power guard — sleep / Modern Standby survival (v6.5.2)
+
+A Modern Standby machine (field log: Lenovo M720Q, i5-8400) degrades long before it sleeps, and the failure mode is invisible to a silence watchdog: in the captured 4-hour log, the S5's stream stopped consuming at the real rate while its callback thread **kept ticking** — first small excess drops (288/576 frames), then the break: leg2 consumed at ~42% of the cable's rate (`off +1,345,794 ppm`), the out2 ring stuffed to 85 ms, ~572 ms of audio passively evicted per second, and the gated drop + drift warden fighting a limit cycle they can never win. The heartbeat stayed fresh, so nothing ever reopened the leg — the path glitched until twinspeak was restarted.
+
+`power_guard = on` (default) adds two layers, every action logged as `power guard :`:
+
+* **Suspend / resume hooks** (WM_POWERBROADCAST on a hidden window): `PBT_APMSUSPEND` parks the pumps — no more data into a device the OS is taking away — and suppresses the watchdog (no reopen storms mid-suspend). On the resume pair the health loop rebuilds the capture pin **and both legs from scratch**, replays the startup chime, and resets the warden/hint state. A post-sleep stream is never trusted.
+* **Consumption-collapse sentinel**: a healthy 48 kHz link never leaves ±10% (the same log's worst *healthy* wobble was ±4000 ppm). Two consecutive 1-s windows beyond that triggers a fix, branched by sign: a **positive** collapse (the device under-consumed — the field log's half-alive S5) reopens that leg fresh; a **negative** collapse (the leg asked for frames the capture never delivered) rebuilds the capture pin instead. This catches the degraded sleep-**entry** window — which fires *before* the suspend broadcast — plus any driver reset that leaves a thread ticking at a bogus rate.
+
+Worst case across any sleep with the guard on: one fresh reopen on wake and a chime, instead of a permanently glitching path. `power_guard = off` restores exact v6.5.1 behavior.
+
+## CPU placement — pin twinspeak to your audio cores (v6.5.3)
+
+The realtime machinery was already there: MMCSS `Pro Audio` registration + time-critical priority on every pump and device thread (v3.8), FTZ/DAZ denormal guards (v6.5), high-resolution waitable timers with a deliberate `YieldProcessor` spin only at the KS deadline, lock-free CAS rings with wrap-aware bulk memcpys (v6.5), and `-O3 -march=x86-64-v3` with `-ffp-contract=off` so nothing can bend the bit-exact path. What the scheduler did with all that was free-roam every thread across every core — colliding with desktop and DPC churn, going cache-cold on each migration, and sharing the KS deadline core with whatever Windows decided to run there. Two keys fix the placement:
+
+* `cpu_affinity` — pin **every** thread to a fixed set of logical CPUs, applied process-wide before any audio thread exists (everything inherits). Accepted values: `last:2` (the LAST two logical CPUs — on a 6-thread i5-8400 that is CPUs 4 and 5, mask `0x30`), an explicit `4,5` or inclusive `4-5` (0-based, as Task Manager numbers them), a raw mask `0x30`, or `off`. Requested CPUs outside the system affinity are clamped and the banner says so. Pair it with your Process Lasso rule for audiodg.exe and the whole audio chain lives on the same dedicated cores, away from the desktop churn on the first ones.
+* `priority` — raise the **process** class: `normal`, `above_normal`, `high`, `realtime`, or `off`. The audio threads already run time-critical on their own; `high` lifts the rest of the process (health loop, watchers, reopen logic) to match. `realtime` is overkill and can starve the USB stack — `high` is the right class. One interaction is handled: in the HIGH class `HIGHEST == TIME_CRITICAL == 15`, which would silently erase the `out2_first` notch, so there the mains pump takes `ABOVE_NORMAL` instead.
+
+Both default to `off` when absent (exact v6.5.2 behavior); the shipped `twinspeak.ini` sets `cpu_affinity = last:2` + `priority = high`. The banner reports both on every start (`cpu placement :` / `priority :` lines). `generate_ini.bat` does not emit these keys.
 
 ## Center presence gates (out2 plays center ONLY while it is genuinely present)
 
@@ -159,6 +183,9 @@ Every key is documented in place in `twinspeak.ini` (generated by `generate_ini.
 | `drift_correct_ms` | 10 | trigger distance from baseline (clamped 2..500) |
 | `center_gate` | on | ch3 digital zero → out2 keep-alive only |
 | `center_upmix_guard` | on | mute Windows' stereo→8ch FC upmix fingerprint |
+| `power_guard` | — | sleep survival: suspend parks, resume rebuilds, collapse sentinel reopens; default ON even when the key is absent (not in `generate_ini.bat`) |
+| `cpu_affinity` | — | v6.5.3: pin every thread to a CPU set — `last:N` / `4,5` / `4-5` / `0x30` / `off`; default off (not in `generate_ini.bat`) |
+| `priority` | — | v6.5.3: process class `normal` / `above_normal` / `high` / `realtime` / `off`; default off (not in `generate_ini.bat`) |
 
 ## Building from source
 
@@ -172,7 +199,7 @@ Single translation unit (`twinspeak.cpp` + vendored `miniaudio.h`), static x64 c
 
 ```
 twinspeak.exe        the engine (from Releases)
-generate_ini.bat     writes twinspeak.ini (tuned config; backs up any previous one)
+generate_ini.bat     writes twinspeak.ini (interactive prompts, Enter = tuned default; advanced key=value prompt for any key; self-verifies)
 twinspeak.ini        reference copy of exactly what the bat generates
 twinspeak.cpp        the whole engine (single translation unit)
 miniaudio.h          WASAPI/output layer (vendored, https://miniaud.io)
