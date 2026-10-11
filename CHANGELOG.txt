@@ -1,3 +1,63 @@
+twinspeak v6.5.5 -- the FACE build (icon + Task Manager name)
+============================================
+
+What changed in v6.5.5 (nothing in the audio path)
+--------------------------------------------------
+Field directive: "I want an idea for an icon for it, and that the task
+manager names the program TwinSpeak."
+
+  * ICON: twinspeak.exe ships a multi-size icon (256/128/64/48/32/24/16),
+    concept "one voice, twin speakers" -- a white waveform enters a dark
+    tile, forks at a node into two IDENTICAL mirrored legs, each ending
+    in a speaker driver; cyan = the mains leg (out1), amber = the voice
+    leg (out2). The .ico also ships beside the exe for desktop
+    shortcuts; the generator (scripts/make_icon_v655.py in the source
+    kit) re-renders it from scratch.
+
+  * VERSIONINFO: the exe now carries a version resource, so Task Manager
+    calls it "TwinSpeak" (FileDescription) instead of the bare image
+    name; Explorer > Properties > Details shows ProductName "TwinSpeak",
+    FileVersion/ProductVersion 6.5.5.0, OriginalFilename twinspeak.exe.
+
+  * BUILD: build.sh compiles twinspeak.rc (icon + VERSIONINFO; windows.h
+    not required) and links the resource object into the exe -- zig rc on
+    the pip-zig path, windres -O coff on an llvm-mingw path. Engine
+    sources otherwise unchanged: zero audio-path deltas, same flags,
+    same static CRT, same single file.
+
+
+twinspeak v6.5.4 -- the PLACEMENT PULLED build
+============================================
+
+What changed in v6.5.4 (v6.5.3's CPU placement is gone)
+-------------------------------------------------------
+Field verdict: "Turns out it was from the cpu affinity." The v6.5.3
+placement layer got field-tested and the pin was PROVEN to be the glitch
+source. The engineering post-mortem, for the record:
+
+  * A deadline-spin realtime engine wants the scheduler's FULL core
+    inventory. The KS thread's final-stretch YieldProcessor spin is a
+    latency optimization that silently assumes a free neighbor core
+    exists; pin every thread to 2 cores and the spin now runs against
+    the very pumps and capture thread that need those cycles.
+  * An MMCSS-boosted audiodg.exe (Pro Audio, priority ~23) on the same
+    pair outranks twinspeak's time-critical-15 threads; on disjoint
+    cores that is irrelevant, on SHARED cores it is a fight twinspeak
+    audibly loses.
+  * Windows' scheduler across all 6 cores was the better placing agent
+    all along -- v6.5.2's free-roaming was glitch-free for months.
+
+Removed entirely: cpu_affinity, priority, applyCpuPlacement, the
+process-wide mask, the banner's placement lines, the pumpThread
+class-aware notch, the ini template section. Exact v6.5.2 scheduling
+returns; the engine otherwise unchanged from v6.5.3 (power guard stays).
+
+Note: the ini parser silently ignores unknown keys, so an ini that still
+carries cpu_affinity/priority lines keeps working untouched -- no need
+to edit it. audiodg.exe placement remains a Process Lasso concern,
+outside twinspeak entirely.
+
+
 twinspeak v6.5.3 -- the CPU PLACEMENT build
 ==========================================
 
