@@ -1,5 +1,19 @@
 // ============================================================================
-//  twinspeak v6.5.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.4 (field verdict: "Turns out it was from the cpu affinity" -- the
+//          v6.5.3 CPU PLACEMENT shipped, got field-tested, and the pin was
+//          PROVEN to be the glitch source: with every thread on 2 cores, the
+//          KS thread's deadline spin assumes a free neighbor core that no
+//          longer exists, and an MMCSS-boosted audiodg.exe on the same pair
+//          turned scheduling into a fight twinspeak could lose audibly. The
+//          whole placement layer is PULLED: no cpu_affinity, no priority
+//          class, no process-wide mask -- exact v6.5.2 scheduling. Lesson
+//          recorded: a deadline-spin realtime engine wants the scheduler's
+//          full core inventory, not a reserved pair. audiodg.exe placement
+//          remains a Process Lasso concern, outside twinspeak entirely.
+//          Unknown ini keys are silently ignored, so inis that still carry
+//          the v6.5.3 keys keep working untouched.)
 //
 //  v6.5.3 (field directive: "how optimized is this, actually? ... I want to
 //          also ensure it runs on the last two threads of my cpu, same going
@@ -894,13 +908,6 @@ struct Config {
     // stream ticks at a bogus rate with a FRESH heartbeat -- the silence
     // watchdog cannot see it). off = exact v6.5.1 behavior.
     bool        powerGuard     = true;
-    // v6.5.3 CPU placement: pin every thread to a fixed set of logical CPUs
-    // and optionally raise the process priority class. Raw ini strings here;
-    // applyCpuPlacement() resolves + applies them in main() BEFORE any audio
-    // thread exists, so every thread inherits. Empty = off (v6.5.2 behavior:
-    // the OS scheduler places all threads wherever it likes).
-    std::string cpuAffinity    = "";   // "", "last:N", "4,5", "4-5", "0x30"
-    std::string priority       = "";   // "", "normal", "above_normal", "high", "realtime"
 };
 static Config g_cfg;
 
@@ -1904,15 +1911,8 @@ static DWORD WINAPI pumpThread(LPVOID p) {
     // most attention"). The movers are trivial memcpy work; leg1's deeper
     // raw ring absorbs any scheduling deference. Device threads stay equal:
     // both are deadline-bound and must never be ranked against each other.
-    if (idx == 0 && g_cfg.out2First) {
-        // v6.5.3: keep the notch real in EVERY process class. HIGHEST sits
-        // below TIME_CRITICAL in NORMAL (10 vs 15) and REALTIME (26 vs 31),
-        // but in the HIGH class both map to 15 -- there the mains pump takes
-        // ABOVE_NORMAL (11) so the center leg keeps its scheduling edge.
-        SetThreadPriority(GetCurrentThread(),
-            GetPriorityClass(GetCurrentProcess()) == HIGH_PRIORITY_CLASS
-                ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_HIGHEST);
-    }
+    if (idx == 0 && g_cfg.out2First)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     // SYNCHRONIZATION timer (no MANUAL_RESET flag!). A manual-reset timer
     // stays signaled after its first expiry -- WaitForSingleObject does not
@@ -2752,7 +2752,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2980,23 +2980,6 @@ static void writeTemplate(const char* path) {
         "; fires before the suspend broadcast. Every action is logged.\n"
         "power_guard = on\n"
         "\n"
-        "; CPU PLACEMENT (v6.5.3) -- pin every twinspeak thread to a fixed set of\n"
-        "; logical CPUs (0-based, as Task Manager numbers them) instead of letting\n"
-        "; the scheduler roam all cores. Pair this with your Process Lasso rule for\n"
-        "; audiodg.exe and the whole audio chain lives on the same dedicated cores,\n"
-        "; away from the desktop/DPC churn on the first ones.\n"
-        ";   last:2     the LAST two logical CPUs (a 6-thread i5-8400: CPUs 4-5)\n"
-        ";   4,5 / 4-5  an explicit list / an inclusive range (0-based)\n"
-        ";   0x30       a raw affinity mask\n"
-        ";   off        the OS scheduler decides (v6.5.2 behavior)\n"
-        "; priority raises the PROCESS class: normal | above_normal | high |\n"
-        "; realtime. The audio threads already run MMCSS 'Pro Audio' + time-\n"
-        "; critical on their own -- 'high' lifts the REST of the process (health\n"
-        "; loop, watchers, reopen logic) to match. realtime is overkill and can\n"
-        "; starve the USB stack: 'high' is the right class here.\n"
-        "cpu_affinity = last:2\n"
-        "priority = high\n"
-        "\n"
         "; CENTER PRESENCE (v6.1) -- out2 plays the center channel ONLY while it\n"
         "; is genuinely present. Two gates, both default ON:\n"
         ";   center_gate -- a block whose ch3 is digital zero emits NOTHING but\n"
@@ -3093,8 +3076,6 @@ static bool loadIni(const char* path) {
         else if (key == "drift_guard")      g_cfg.driftGuard     = !isOff(val);  // v6.4
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
-        else if (key == "cpu_affinity")     g_cfg.cpuAffinity    = lower(val);   // v6.5.3
-        else if (key == "priority")         g_cfg.priority       = lower(val);   // v6.5.3
     }
     fclose(f);
     // legacy fallback: buffer_size applies to any leg without an explicit outXms
@@ -3388,148 +3369,6 @@ static void printLegDevice(int idx) {
 // ---------------------------------------------------------------- main ------
 static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
 
-// --------------------------------------------------- v6.5.3 CPU PLACEMENT --
-// Resolve cpu_affinity / priority AFTER the ini parse and BEFORE any audio
-// thread exists (called from main right after timeBeginPeriod): the affinity
-// mask and the priority class are process-wide state that every later
-// CreateThread inherits. Deliberately SILENT -- tlog output here would land
-// on a console that background mode is about to detach; the banner reports
-// exactly what was applied, and why anything was refused.
-static std::string g_affinityDesc = "off -- the OS scheduler places all threads (cpu_affinity unset)";
-static std::string g_priorityDesc = "off -- process class stays NORMAL (threads keep their own MMCSS/time-critical boosts)";
-
-// "4-5" from a contiguous run of bits, "0,3,5" from scattered ones.
-static std::string maskToCpuList(unsigned long long m) {
-    std::string s;
-    char buf[24];
-    int runStart = -1;
-    for (int i = 0; i <= 64; ++i) {
-        const bool bit = (i < 64) && ((m >> i) & 1ULL);
-        if (bit && runStart < 0) runStart = i;
-        if (!bit && runStart >= 0) {
-            if (!s.empty()) s += ",";
-            if (i - 1 > runStart) { snprintf(buf, sizeof buf, "%d-%d", runStart, i - 1); s += buf; }
-            else                  { snprintf(buf, sizeof buf, "%d", runStart);           s += buf; }
-            runStart = -1;
-        }
-    }
-    return s;
-}
-
-// One CPU index, 0-based ("as Task Manager numbers them"). A CPU the process
-// is not allowed to use is skipped and flagged, not an error.
-static bool addCpuIndex(const std::string& tok, unsigned long long sysMask,
-                        unsigned long long& want, bool& clamped) {
-    if (tok.empty()) return false;
-    char* endp = nullptr;
-    const long idx = strtol(tok.c_str(), &endp, 10);
-    if (!endp || *endp != '\0' || idx < 0 || idx > 63) return false;
-    const unsigned long long bit = 1ULL << idx;
-    if (!(sysMask & bit)) { clamped = true; return true; }
-    want |= bit;
-    return true;
-}
-
-static void applyCpuPlacement() {
-    unsigned long long sysMask = 0, procMask = 0;
-    if (!GetProcessAffinityMask(GetCurrentProcess(), (PDWORD_PTR)&procMask, (PDWORD_PTR)&sysMask)
-        || !sysMask)
-        sysMask = procMask ? procMask : 0xFFFFULL;
-
-    // ---- cpu_affinity: every thread this process ever spawns inherits ----
-    const std::string& a = g_cfg.cpuAffinity;
-    if (!a.empty() && a != "off") {
-        unsigned long long want = 0, asked = 0;
-        bool ok = true, clamped = false;
-        std::string why;
-        if (a.rfind("last:", 0) == 0) {
-            const int n = atoi(a.c_str() + 5);
-            if (n <= 0) { ok = false; why = "last:N needs N >= 1"; }
-            else {
-                int left = n;
-                for (int i = 63; i >= 0 && left > 0; --i)
-                    if ((sysMask >> i) & 1ULL) { want |= (1ULL << i); --left; }
-                if (left > 0) clamped = true;   // asked for more CPUs than exist
-            }
-        } else if (a.rfind("0x", 0) == 0 || a.rfind("0X", 0) == 0) {
-            asked = strtoull(a.c_str(), nullptr, 16);
-            want  = asked & sysMask;
-            if (!want)      { ok = false; why = "mask names no usable CPU"; }
-            else if (want != asked) clamped = true;
-        } else if (a.find(',') != std::string::npos) {
-            size_t pos = 0;
-            while (pos <= a.size()) {
-                size_t comma = a.find(',', pos);
-                if (comma == std::string::npos) comma = a.size();
-                const std::string tok = a.substr(pos, comma - pos);
-                if (!addCpuIndex(tok, sysMask, want, clamped)) {
-                    ok = false; why = "bad CPU index '" + tok + "'"; break;
-                }
-                pos = comma + 1;
-            }
-            if (ok && !want) { ok = false; why = "no usable CPU in the list"; }
-        } else if (a.find('-') != std::string::npos) {
-            const size_t dash = a.find('-');
-            const int lo = atoi(a.substr(0, dash).c_str());
-            const int hi = atoi(a.substr(dash + 1).c_str());
-            if (lo < 0 || hi > 63 || lo > hi) { ok = false; why = "range needs 0 <= lo <= hi <= 63"; }
-            else for (int i = lo; i <= hi; ++i) {
-                const unsigned long long bit = 1ULL << i;
-                if (sysMask & bit) want |= bit; else clamped = true;
-            }
-        } else {
-            if (!addCpuIndex(a, sysMask, want, clamped)) {
-                ok = false; why = "single 0-based CPU index expected (e.g. 4)";
-            } else if (!want) {
-                ok = false; why = "that CPU is not available to this process";
-            }
-        }
-        if (ok && want) {
-            char maskTxt[24];
-            snprintf(maskTxt, sizeof maskTxt, "0x%llX", want);
-            if (SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)want)) {
-                std::string d = "pinned to CPU" + maskToCpuList(want) + " (mask "
-                              + maskTxt + ") -- every thread inherits";
-                if (clamped) d += "; clamped to this system's usable CPUs";
-                g_affinityDesc = d;
-            } else {
-                g_affinityDesc = "SetProcessAffinityMask refused ("
-                               + maskToCpuList(want) + ") -- staying unpinned";
-            }
-        } else if (!ok) {
-            g_affinityDesc = "UNRECOGNIZED cpu_affinity '" + a + "' -- off (" + why
-                           + "; forms: last:N | 4,5 | 4-5 | 0x30 | off)";
-        }
-    }
-
-    // ---- priority: the PROCESS class behind the threads' own boosts ----
-    const std::string& pr = g_cfg.priority;
-    if (!pr.empty() && pr != "off") {
-        DWORD cls = 0;
-        if      (pr == "normal")       cls = NORMAL_PRIORITY_CLASS;
-        else if (pr == "above_normal") cls = ABOVE_NORMAL_PRIORITY_CLASS;
-        else if (pr == "high")         cls = HIGH_PRIORITY_CLASS;
-        else if (pr == "realtime")     cls = REALTIME_PRIORITY_CLASS;
-        if (!cls) {
-            g_priorityDesc = "UNRECOGNIZED priority '" + pr
-                           + "' -- staying NORMAL (forms: normal | above_normal | high | realtime | off)";
-        } else if (!SetPriorityClass(GetCurrentProcess(), cls)) {
-            g_priorityDesc = "SetPriorityClass refused -- staying NORMAL";
-        } else if (cls == HIGH_PRIORITY_CLASS) {
-            g_priorityDesc = "HIGH process class -- lifts the non-audio threads (health loop,\n"
-                             "                            watchers, reopen logic); the audio threads already run\n"
-                             "                            MMCSS 'Pro Audio' + time-critical on their own";
-        } else if (cls == REALTIME_PRIORITY_CLASS) {
-            g_priorityDesc = "REALTIME process class -- CAREFUL: this can starve the USB stack,\n"
-                             "                            input and networking; 'high' is the sane class for audio";
-        } else if (cls == ABOVE_NORMAL_PRIORITY_CLASS) {
-            g_priorityDesc = "ABOVE_NORMAL process class";
-        } else {
-            g_priorityDesc = "NORMAL process class";
-        }
-    }
-}
-
 int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
     std::string iniPath;
@@ -3587,7 +3426,6 @@ int main(int argc, char** argv) {
     }
 
     timeBeginPeriod(1);
-    applyCpuPlacement();               // v6.5.3: affinity + priority class BEFORE any thread spawns
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
     g_bootMs = GetTickCount64();           // v3.8 watchdog grace timer
     {                                      // v6.4: lag display clock anchors
@@ -3977,7 +3815,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.3         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.4         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4013,8 +3851,6 @@ int main(int argc, char** argv) {
            "                            fresh. The v6.5.1 field log: an S5 came back from sleep at ~42%%\n"
            "                            consumption with a fresh heartbeat and glitched forever.\n",
            g_cfg.powerGuard ? "ON" : "OFF (power_guard = off -- v6.5.1 behavior)");
-    tlog("[twinspeak] cpu placement : %s\n", g_affinityDesc.c_str());
-    tlog("[twinspeak] priority      : %s\n", g_priorityDesc.c_str());
     tlog("[twinspeak] leg1 (mains)   : \"%s\" | %s | period %u ms x2\n",
            n1.c_str(),
            g_leg[0].backend == 1 ? "WDM-KS (kernel streaming)" :
