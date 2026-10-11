@@ -221,10 +221,10 @@ LICENSE              MIT (see Third-party components for miniaudio)
 This repository's code exists because these projects paved the way — thank you:
 
 * **[miniaudio](https://miniaud.io) by David Reid** — the WASAPI output/capture layer. `miniaudio.h` is vendored here and does the heavy lifting of every exclusive WaveRT device open on both legs. Dual-licensed public domain / MIT-0; used here under the public-domain grant, so it adds no terms of its own.
-* **[FlexASIO](https://github.com/etcmstar/FlexASIO) by Etienne Dechamps** — the proof that Windows Kernel Streaming can be driven at ASIO-grade latency. twinspeak's `backend = ks` is an original implementation of the public KS/WaveRT property interface, but the *idea*, the wire layout and the confidence all came from studying FlexASIO. No FlexASIO code is used.
+* **[FlexASIO](https://github.com/dechamps/FlexASIO) by Etienne Dechamps** — the proof that Windows Kernel Streaming can be driven at ASIO-grade latency. twinspeak's `backend = ks` is an original implementation of the public KS/WaveRT property interface, but the *idea*, the wire layout and the confidence all came from studying FlexASIO. No FlexASIO code is used.
 * **[VB-Audio Virtual Audio Cable](https://vb-audio.com/Cable/)** — the 8ch capture backbone (enable Clock Correction for it in the VAC Control Panel to zero the `off` column).
 * Lineage: CenterFold → twinspeak v3 (two-device relay) → v6.0 clock discipline → v6.1 alignment + center gates → v6.2 background + chimes → v6.3/6.3.1 WDM-KS → v6.4 Drift Warden → v6.5 bit-exact optimization pass → v6.5.1 the `err` column.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The vendored `miniaudio.h` keeps its own public domain / MIT-0 statement inside the file; the LICENSE's Third-party components section covers it. Swap the `Copyright (c) 2026 twinspeak contributors` line for your name or GitHub handle when you publish.
+MIT — see [LICENSE](LICENSE). The vendored `miniaudio.h` keeps its own public domain / MIT-0 statement inside the file; the LICENSE's Third-party components section covers it. Swap the `Copyright (c) October 2026 twinspeak contributors` line for your name or GitHub handle when you publish.
