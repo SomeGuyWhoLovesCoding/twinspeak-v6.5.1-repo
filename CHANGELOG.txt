@@ -1,3 +1,55 @@
+twinspeak v6.5.7 -- the 500 MICROSECOND PUMP build (one audio-thread change)
+============================================
+
+What changed in v6.5.7 (nothing in the sample path)
+---------------------------------------------------
+Field report: "it's something that doesn't resemble a chime."
+
+The audio-thread inspection, on the record:
+
+  * WHERE THE NON-CHIME BEEP LIVES: bufferSwitchFill()'s shortfall
+    path. When the out ring cannot fill a device buffer switch, the
+    engine follows the ASIO underrun convention and fills the gap by
+    LOOPING the last played fragment (replayFill: lastBlock,
+    i % lastN -- up to kReplayMaxPeriods = 4 periods, ~16 ms at
+    outXms = 4). Looping a short fragment of TONAL program audio
+    synthesizes a buzzy tone at the fragment repeat rate (~60-250 Hz
+    plus the fragment's own content) -- a beep that is literally made
+    of the program audio, which is why it does not resemble the chime,
+    and it "resolves afterward" because it ends the moment the ring
+    refills. The same filler runs the drift warden's in-place pad.
+
+  * WHAT FEEDS IT: the pump tick. Both pump threads (and the KS
+    pacing thread) drained on a PERIODIC 1 ms waitable timer. Every
+    buffer switch therefore had to survive up to one millisecond of
+    pump-refill jitter plus the pump's own body time.
+
+  * THE FIX (user directive: "the speed interval ... 500 microseconds,
+    yeah, the very minimum"): a periodic SetWaitableTimer cannot go
+    below 1 ms -- lPeriod is whole milliseconds. So the high-res
+    timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION was already in use)
+    now runs ONE-SHOT with a relative due time of -5000 (100-ns
+    units = 500 us, lPeriod = 0) and is RE-ARMED at the top of every
+    cycle / every KS slack sleep. 0.5 ms is the minimum the OS
+    honors; the high-resolution flag is what makes it real (without
+    it the expiry coalesces to the scheduler tick). The KS slack
+    threshold moved with it: sleep only when > 0.5 ms of slack
+    (kSampleRate / 2000), timeout 2 ms.
+
+  * COST: the pumps now wake at 2 kHz instead of 1 kHz -- trivial
+    memcpy bursts each wake (drain-to-empty loop), a fraction of a
+    percent of a core on the v6.5-optimized path. The KS thread
+    polls at 2 kHz only while it has slack to burn.
+
+  * NOTE: an interim v6.5.6 (watchdog_ms / reopen_chime ini keys,
+    the chime diagnosis) was WITHDRAWN -- it did not match the ear.
+    Its full source archive ships beside this build unchanged for
+    anyone who wants those keys back.
+
+The replay/shortfall rules, the rings, the gates, the bit-exact
+guarantee: untouched. Version resource 6.5.7.0.
+
+
 twinspeak v6.5.5 -- the FACE build (icon + Task Manager name)
 ============================================
 

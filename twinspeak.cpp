@@ -1,6 +1,24 @@
 // ============================================================================
-//  twinspeak v6.5.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
+//  v6.5.7 (field report: "it's something that doesn't resemble a chime" --
+//          the interim watchdog_key build is WITHDRAWN to a side archive;
+//          this build ships the audio-thread inspection result instead.
+//          ONE change, zero audio-path deltas: the pump tick drops from
+//          1 ms to 500 us -- the waitable-timer minimum. A periodic timer
+//          cannot go sub-ms (lPeriod is whole milliseconds), so both the
+//          pump threads and the KS pacing thread now run the high-res
+//          timer ONE-SHOT (due time -5000 in 100-ns units, lPeriod = 0),
+//          re-armed at the top of every cycle. Half the tick = half the
+//          refill latency the buffer switch can observe -- the shortfall
+//          path (replayFill looping the last ~4-period fragment, which
+//          synthesizes a buzzy fragment-loop "beep" out of the PROGRAM
+//          audio, not the chime) fires later or never. The KS slack
+//          threshold moves with it: sleep only when >0.5 ms of slack.
+//          Cost: two pumps waking at 2 kHz -- trivial memcpy bursts,
+//          well under the v6.5 optimization pass's pay grade.)
+//
+//  v6.5.5 was the last shipped baseline; see its notes below.
 //  v6.5.4 (field verdict: "Turns out it was from the cpu affinity" -- the
 //          v6.5.3 CPU PLACEMENT shipped, got field-tested, and the pin was
 //          PROVEN to be the glitch source: with every thread on 2 cores, the
@@ -1902,6 +1920,17 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
 // cable delivered is what the device plays, sample for sample. Excess is
 // handled by the playback callback's gated drop; shortfall by its replay --
 // both at the buffer switch, exactly where an ASIO driver would act.
+// v6.5.7: the pump tick is 500 us -- the waitable-timer minimum. A PERIODIC
+// SetWaitableTimer cannot go below 1 ms (lPeriod is whole milliseconds), so
+// the high-resolution timer runs ONE-SHOT (lPeriod = 0) with a relative due
+// time in 100-ns units and is re-armed at the top of every cycle. The
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION flag is what makes 0.5 ms real:
+// without it the OS coalesces the expiry to the scheduler tick. Half the
+// tick = half the refill latency the buffer switch can observe, so the
+// shortfall-replay path (replayFill's fragment loop -- the audible
+// glitch/buzz under load) fires that much later or never.
+static constexpr long long kTick500us = -5000;   // 0.5 ms, negative = relative (100-ns units)
+
 static DWORD WINAPI pumpThread(LPVOID p) {
     const int idx = (int)(INT_PTR)p;
     Leg& L = g_leg[idx];
@@ -1923,11 +1952,11 @@ static DWORD WINAPI pumpThread(LPVOID p) {
                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                         TIMER_ALL_ACCESS);
     if (!hTimer) hTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-    LARGE_INTEGER due; due.QuadPart = -1;
+    LARGE_INTEGER due; due.QuadPart = kTick500us;   // v6.5.7: one-shot 500 us, re-armed per cycle
     bool timerOK = false;
-    if (hTimer) timerOK = SetWaitableTimer(hTimer, &due, 1, nullptr, nullptr, FALSE) != 0;
+    if (hTimer) timerOK = SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE) != 0;
     if (!timerOK)
-        tlog( "[twinspeak] leg%d: 1 ms timer unavailable; poll degrades to Sleep(1)\n", idx + 1);
+        tlog( "[twinspeak] leg%d: 500 us timer unavailable; poll degrades to Sleep(1)\n", idx + 1);
 
     // v6.5: outCh is no longer needed here -- mixBlock() derives the leg's
     // channel count from idx itself (the config is startup-frozen).
@@ -1935,8 +1964,11 @@ static DWORD WINAPI pumpThread(LPVOID p) {
     float*       chunk  = L.chunk.data();
 
     while (g_run.load()) {
-        if (timerOK) WaitForSingleObject(hTimer, 50);
-        else         Sleep(1);
+        if (timerOK) {
+            due.QuadPart = kTick500us;   // v6.5.7: re-arm one-shot every cycle
+            SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(hTimer, 50);
+        } else         Sleep(1);
         if (!g_run.load()) break;
         // v6.5.2: PBT_APMSUSPEND park -- the OS is taking the devices;
         // stop feeding the out rings. The raw ring overflows harmlessly
@@ -2666,8 +2698,8 @@ static DWORD WINAPI ksThread(LPVOID p) {
     HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!hTimer) hTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-    LARGE_INTEGER due; due.QuadPart = -1;
-    const bool timerOK = hTimer && SetWaitableTimer(hTimer, &due, 1, nullptr, nullptr, FALSE);
+    LARGE_INTEGER due; due.QuadPart = kTick500us;   // v6.5.7: one-shot 500 us, re-armed per sleep
+    const bool timerOK = hTimer && SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
 
     ksSetPinState(K.pin, KSSTATE_RUN);   // go live: the DAC starts eating the prefill
 
@@ -2704,9 +2736,13 @@ static DWORD WINAPI ksThread(LPVOID p) {
         long long ahead = (long long)K.writeFrames - (long long)K.playFrames;
         if (ahead >= (long long)leadFr) {
             const long long slackFr = ahead - (long long)leadFr;
-            if (slackFr > (long long)(kSampleRate / 1000)) {      // > 1 ms of slack
-                if (timerOK) WaitForSingleObject(hTimer, 1);
-                else         Sleep(1);
+            if (slackFr > (long long)(kSampleRate / 2000)) {      // > 0.5 ms of slack
+                if (timerOK) {
+                    due.QuadPart = kTick500us;                    // v6.5.7: re-arm one-shot 500 us
+                    SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
+                    WaitForSingleObject(hTimer, 2);
+                } else
+                    Sleep(1);
             } else {
                 YieldProcessor();   // final stretch: spin, no scheduler round-trip
             }
@@ -2752,7 +2788,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3815,7 +3851,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.5         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.7         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
