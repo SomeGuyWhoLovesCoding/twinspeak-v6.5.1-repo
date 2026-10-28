@@ -1,5 +1,29 @@
 // ============================================================================
-//  twinspeak v6.5.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.9 (field directive: "Read the actual per-leg device buffering at
+//          runtime." -- the align line's est path is arithmetic on CONFIGURED
+//          sizes; this build adds a MEASURED reading off the live devices,
+//          printed every 10 s as the 'devbuf' line next to the health line.
+//          For each leg it reports the frames queued AHEAD of the DAC's play
+//          cursor, from the authoritative source per transport:
+//            WASAPI shared   -> IAudioClient::GetCurrentPadding (the live pad)
+//            WASAPI exclusive -> the whole device buffer (WaveRT exclusive
+//                              drivers misreport padding as 0, and miniaudio
+//                              pops the FULL buffer on each event anyway --
+//                              so the buffer size IS the honest pad);
+//            WDM-KS          -> the pacing thread's own write-minus-play
+//                              lead, read off the DAC position register.
+//          Plus the ring's live depth, so each line is: pad + ring = the
+//          measured waterline per leg, and their difference is the measured
+//          version of the align line's estimate. A DIAGNOSTIC ONLY: nothing
+//          in the sample path, the rings, the rules or the gates changes.
+//          What the line still cannot see: buffering BELOW the USB
+//          packetizer -- the S5's own receiver FIFO / amp silicon (wired
+//          USB does not change this: the FIFO is the S5 firmware's own
+//          choice). If the measured paths read EQUAL while the ear still
+//          hears the center late, that residual is the S5's FIFO, now
+//          proven by elimination instead of estimated.)
 //
 //  v6.5.8 (field report: "the two speakers eventually start delaying each
 //          other sometimes ... I can notice even 10ms on my rhythm game."
@@ -878,10 +902,10 @@ static constexpr size_t   kPeriodMarginFrames = 192;    // 4 ms above the FULL d
 // event mode pops the WHOLE buffer as two back-to-back callbacks.
 static constexpr size_t   kKsMarginFrames     = 48;     // 1 ms above (bite + burst) on a KS leg
 
-// v6.4 drift warden pacing: a correction never fires more than once per 30 s,
-// only after the drift error held for 3 consecutive health windows, and a
-// deliberate pad never exceeds 100 ms of in-place replay.
-static constexpr unsigned kWardenMinIntervalMs = 30000;
+// v6.4 drift warden pacing: a correction never fires more than once per
+// drift_interval_ms (v6.5.8; was the hardcoded 30 s), only after the drift
+// error held for 3 consecutive health windows, and a deliberate pad never
+// exceeds 100 ms of in-place replay.
 static constexpr unsigned kWardenStreakNeeded  = 3;
 static constexpr size_t   kWardenMaxPadFrames  = 4800;   // 100 ms @ 48 kHz
 
@@ -1162,6 +1186,10 @@ struct KsOut {
     bool          havePos     = false;
     unsigned long long posGlitch = 0;  // implausible register reads ignored
     unsigned long long wrote     = 0;  // frames handed to the DAC (diagnostics)
+    // v6.5.9: the LIVE write-minus-play lead (frames queued ahead of the DAC's
+    // play cursor), stored by ksThread every pacing cycle -- the health loop
+    // prints it in ms as the measured device buffering of a KS leg.
+    std::atomic<unsigned long long> aheadFr{0};
     HANDLE        thread      = nullptr;
     std::vector<unsigned char> conv;   // format-conversion scratch (private)
     std::vector<float>         fill;   // one period of decoded audio (private)
@@ -2766,6 +2794,8 @@ static DWORD WINAPI ksThread(LPVOID p) {
         }
         // ---- pacing: sleep while far ahead of the lead, spin at the deadline ----
         long long ahead = (long long)K.writeFrames - (long long)K.playFrames;
+        K.aheadFr.store((unsigned long long)(ahead > 0 ? ahead : 0),
+                        std::memory_order_relaxed);   // v6.5.9: live device pad
         if (ahead >= (long long)leadFr) {
             const long long slackFr = ahead - (long long)leadFr;
             if (slackFr > (long long)(kSampleRate / 2000)) {      // > 0.5 ms of slack
@@ -2820,7 +2850,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2972,7 +3002,9 @@ static void writeTemplate(const char* path) {
         "; (a 1-period loop has no write lead at all). The DAC adds its hardware\n"
         "; FIFO on top (~1-2 ms, printed). v6.3.1: with both legs on ks the\n"
         "; banner's align line prints the est-path DIFFERENCE and which delay\n"
-        "; knob to move -- the delay trim starts from that number.\n"
+        "; knob to move -- the delay trim starts from that number. v6.5.9: the\n"
+        "; health log's 'devbuf' line (every 10 s) prints the MEASURED version\n"
+        "; of those paths off the live devices (device pad + ring depth).\n"
         "; KS bypasses the Windows endpoint: no endpoint volume there, so\n"
         "; pin_outputs is a no-op on a KS leg -- volume_follow still governs it\n"
         "; (applied in the pump, exactly as before). If the driver refuses the\n"
@@ -3899,7 +3931,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.8         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.9         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -3981,7 +4013,9 @@ int main(int argc, char** argv) {
     tlog("[twinspeak] align          : delay1 +%d ms, delay2 +%d ms -- bit-exact ring delay; put it on the EARLY leg\n"
            "                            est path: leg1 ~%.1f ms vs leg2 ~%.1f ms (difference %+.1f ms with the\n"
            "                            current delay included -> %s). The S5's own\n"
-           "                            amp latency is OUTSIDE the print -- the ear trims the last 1-2 ms.\n",
+           "                            amp latency is OUTSIDE the print -- the ear trims the last 1-2 ms.\n"
+           "                            v6.5.9: the health log's 'devbuf' line re-prints this from the LIVE\n"
+           "                            devices every 10 s (padding / exclusive buffer / KS lead + ring).\n",
            (int)(g_cfg.delay1Ms + 0.5f), (int)(g_cfg.delay2Ms + 0.5f),
            ep1, ep2, ep1 - ep2,
            (ep1 - ep2) > 0.05 ? "leg1 arrives later -- raise delay2_ms" :
@@ -4358,6 +4392,58 @@ int main(int argc, char** argv) {
                      g_volMuted.load(std::memory_order_relaxed) ? " M" : "  ");
         else
             snprintf(volStr, sizeof(volStr), "%6s", "---");
+        // ---- v6.5.9 MEASURED device buffering per leg (the 'devbuf' line) ----
+        // The align line's est path is arithmetic on CONFIGURED sizes. This
+        // is the live reading, from the authoritative source per transport:
+        //   WASAPI shared    -> IAudioClient::GetCurrentPadding (the live pad)
+        //   WASAPI exclusive -> the whole device buffer (WaveRT exclusive
+        //                       drivers misreport padding as 0, and miniaudio
+        //                       pops the FULL buffer per event, so the buffer
+        //                       size IS the honest pad);
+        //   WDM-KS           -> the pacing thread's write-minus-play lead off
+        //                       the DAC position register (the live sawtooth).
+        // Telemetry only, best-effort: a failed call just prints ----.
+        double      padMs[2]  = { 0.0, 0.0 };
+        const char* padHow[2] = { "----", "----" };
+        for (int i = 0; i < 2; ++i) {
+            Leg& L = g_leg[i];
+            if (L.backend == 1) {
+                if (L.ks.active) {
+                    padMs[i]  = (double)L.ks.aheadFr.load(std::memory_order_relaxed)
+                              * 1000.0 / (double)kSampleRate;
+                    padHow[i] = "ks lead ";
+                }
+            } else if (L.dev.pContext) {
+                const unsigned bf = L.dev.wasapi.actualBufferSizeInFramesPlayback;
+                if (L.isExclusive) {
+                    if (bf) {
+                        padMs[i]  = (double)bf * 1000.0 / (double)kSampleRate;
+                        padHow[i] = "excl buf";
+                    }
+                } else {
+                    ma_IAudioClient* ac =
+                        (ma_IAudioClient*)(void*)L.dev.wasapi.pAudioClientPlayback;
+                    UINT32 pad = 0;
+                    if (ac && SUCCEEDED(ma_IAudioClient_GetCurrentPadding(ac, &pad))
+                        && pad > 0 && (bf == 0 || pad <= bf * 4)) {  // misreport guard
+                        padMs[i]  = (double)pad * 1000.0 / (double)kSampleRate;
+                        padHow[i] = "padding ";
+                    }
+                }
+            }
+        }
+        if ((sec % 10) == 0) {   // same cadence as the log-file health line
+            const double burstMs = (double)g_capBurstFrames * 1000.0 / (double)kSampleRate;
+            const double path1 = padMs[0] + (double)g_leg[0].out.count() * 1000.0 / kSampleRate + burstMs;
+            const double path2 = padMs[1] + (double)g_leg[1].out.count() * 1000.0 / kSampleRate + burstMs;
+            tlog("\n[twinspeak] devbuf      : leg1 %5.1f ms (%s) + ring %5.1f + burst %.1f = %5.1f ms\n"
+                 "                            leg2 %5.1f ms (%s) + ring %5.1f + burst %.1f = %5.1f ms\n"
+                 "                            measured path diff %+.1f ms -- BELOW-packetizer silicon (the\n"
+                 "                            S5's own FIFO) is still outside these numbers\n",
+                 padMs[0], padHow[0], g_leg[0].out.count() * 1000.0 / kSampleRate, burstMs, path1,
+                 padMs[1], padHow[1], g_leg[1].out.count() * 1000.0 / kSampleRate, burstMs, path2,
+                 path1 - path2);
+        }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
         tlog(g_logToFile
              ? "out1 %5.1f | out2 %5.1f | vol %s | held %5.1f/%5.1f | off %+6ld/%+6ld | und +%llu/%llu | drop +%llu/%llu | corr %llu/%llu | cm +%llu | drift %s | err %s\n"
