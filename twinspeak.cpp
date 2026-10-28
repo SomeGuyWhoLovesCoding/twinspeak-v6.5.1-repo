@@ -1,5 +1,23 @@
 // ============================================================================
-//  twinspeak v6.5.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.8 (field report: "the two speakers eventually start delaying each
+//          other sometimes ... I can notice even 10ms on my rhythm game."
+//          TWO warden gaps closed, zero audio-path deltas:
+//    1. STALE BASELINE: the drift baseline was calibrated ONCE (boot,
+//          seconds 8..15) and never revisited -- but a device reopen (S5
+//          sleep/wake, USB re-enumeration, power-guard rebuild) can
+//          legitimately move the path's real latency afterwards. Every
+//          successful reopen now invalidates the baseline; it re-arms
+//          automatically once the path settles (~14 s), with its own log
+//          line. If the drift column is FLAT while the ears still hear
+//          drift after a re-arm, the offset is device silicon (below the
+//          USB packetizer) -- no host trigger exists.
+//    2. CORRECTION SPACING: the 30 s rate limit was hardcoded. New ini
+//          key drift_interval_ms (default 30000 = exact old behavior,
+//          range 5000..60000): lower it (e.g. 10000) so the warden can
+//          chase ramping drift in tighter circles -- the price is each
+//          correction being an audible skip of up to drift_correct_ms.)
 //
 //  v6.5.7 (field report: "it's something that doesn't resemble a chime" --
 //          the interim watchdog_key build is WITHDRAWN to a side archive;
@@ -920,6 +938,11 @@ struct Config {
     // observes); drift_guard switches the automatic re-pin on top of it.
     bool        driftGuard     = true;   // auto re-pin at >= drift_correct_ms
     float       driftCorrectMs = 10.0f;  // trigger distance from the baseline (ms)
+    // v6.5.8: minimum spacing between warden corrections -- was the hardcoded
+    // kWardenMinIntervalMs = 30000. Lower it for tighter pinning on
+    // latency-critical playback; the price is each correction being an
+    // audible skip/stutter of up to drift_correct_ms.
+    unsigned    driftIntervalMs = 30000;
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
@@ -1240,6 +1263,15 @@ static OutPin g_pin[2];                               // out1/out2 pins (watcher
 // v3.8 watchdog heartbeats: each device callback refreshes its timestamp;
 // the health loop reopens any thread that goes silent >5 s.
 static std::atomic<unsigned long long> g_hbCap{0}, g_hbOut0{0}, g_hbOut1{0};
+// v6.5.8: set by every successful device reopen (watchdog leg/capture, the
+// power-guard resume path). The health loop consumes it: the drift warden's
+// baseline is invalidated and re-armed once the path settles, because a
+// reopen can legitimately change the path's host-side latency (an
+// exclusive->shared fallback renegotiates device buffering; a fresh device
+// start refills its silicon FIFO differently). A boot-time-only baseline
+// goes stale against exactly that -- and the warden then "corrects" the
+// path toward a number that no longer describes it.
+static std::atomic<bool> g_driftRecalReq{false};
 static unsigned long long g_bootMs = 0;
 // v6.4: QPC anchors the lag display (age of the newest played frame in
 // cable time, ms). The drift metric itself needs no clock at all: it is
@@ -2788,7 +2820,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3005,6 +3037,16 @@ static void writeTemplate(const char* path) {
         "drift_guard = on\n"
         "drift_correct_ms = 10\n"
         "\n"
+        "; drift_interval_ms (v6.5.8): minimum spacing between warden corrections\n"
+        "; (default 30000, range 5000..60000 -- the old hardcoded value). Between\n"
+        "; corrections the drift error can keep ramping, and latency-critical\n"
+        "; playback (rhythm games) wants a tighter pin: e.g. 10000 trades more\n"
+        "; frequent small skips for a smaller worst-case offset. Also new in\n"
+        "; v6.5.8: any device reopen (sleep/wake, USB re-enumeration) now\n"
+        "; invalidates the drift baseline and re-arms it once the path settles --\n"
+        "; a boot-time-only baseline went stale against exactly those events.\n"
+        "drift_interval_ms = 30000\n"
+        "\n"
         "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
         "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
         "; cable's rate with a FRESH heartbeat -- the silence watchdog is blind\n"
@@ -3111,6 +3153,7 @@ static bool loadIni(const char* path) {
         else if (key == "ks_periods")      g_cfg.ksPeriods      = (unsigned)atoi(val.c_str()); // v6.3
         else if (key == "drift_guard")      g_cfg.driftGuard     = !isOff(val);  // v6.4
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
+        else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
     }
     fclose(f);
@@ -3126,6 +3169,8 @@ static bool loadIni(const char* path) {
     if (g_cfg.delay2Ms > 1000.0f) g_cfg.delay2Ms = 1000.0f;
     if (g_cfg.ring1Ms >= 0.0f) g_cfg.ring1Ms = clampMs(g_cfg.ring1Ms);
     if (g_cfg.ring2Ms >= 0.0f) g_cfg.ring2Ms = clampMs(g_cfg.ring2Ms);
+    if (g_cfg.driftIntervalMs < 5000)  g_cfg.driftIntervalMs = 5000;
+    if (g_cfg.driftIntervalMs > 60000) g_cfg.driftIntervalMs = 60000;
     // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
     // kernel-streaming pin; anything else stays WASAPI.
     for (int i = 0; i < 2; ++i) {
@@ -3261,6 +3306,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs) {
             L.ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)idx, 0, nullptr);
             if (L.ks.thread) {
                 hbOut(idx);
+                g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
                 tlog( "[twinspeak] leg%d WATCHDOG : reopened \"%s\" (WDM-KS)\n",
                         idx + 1, L.ks.filterName.c_str());
                 if (idx == 1) armChime(false);   // v6.2: signature blip -- the center leg is back
@@ -3284,6 +3330,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs) {
     L.name = nm;
     L.backend = 0;
     hbOut(idx);
+    g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
     // v4.0: a reopen can negotiate a different period (exclusive->shared
     // fallback); the ring floor and the v6.0 gated-drop line follow the
     // REAL period.
@@ -3342,6 +3389,7 @@ static bool tryRestartCap(ma_context* ctx) {
     g_capIsExcl = (cc.capture.shareMode == ma_share_mode_exclusive);
     if (ma_device_start(&g_capDev) != MA_SUCCESS) return false;
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);
+    g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
     tlog( "[twinspeak] capture WATCHDOG: reopened \"%s\" (%s)\n",
             nm.c_str(), g_capIsExcl ? "exclusive" : "shared");
     return true;
@@ -3851,7 +3899,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.7         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.8         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4020,6 +4068,7 @@ int main(int argc, char** argv) {
     double driftBase = 0.0;                              // calibrated inter-speaker offset
     bool   driftBaseOK = false;
     double driftSum = 0.0;  int driftN = 0;              // calibration window
+    bool   driftRecal = false;                           // v6.5.8: this calibration is a re-arm
     int    wardenStreak = 0;
     unsigned long long wardenLastMs = 0;
     // v6.2: the clock hint fires only on a SETTLED path -- at least 10 s
@@ -4179,6 +4228,16 @@ int main(int argc, char** argv) {
                               && (nowMs - g_leg[1].lastReopenMs > 10000)
                               && (nowMs - hbOutGet(0) < 5000)
                               && (nowMs - hbOutGet(1) < 5000);
+            // v6.5.8: a reopen (watchdog leg/capture, power-guard resume) can
+            // legitimately move the path's real latency afterwards -- the boot
+            // baseline goes stale, so it is invalidated and re-armed once the
+            // path settles again (~14 s: 10 s settle + a 4-sample average).
+            if (g_driftRecalReq.exchange(false) && driftBaseOK) {
+                driftBaseOK = false;
+                driftSum = 0.0;  driftN = 0;
+                driftRecal = true;
+                tlog("\n[twinspeak] drift warden : device reopen -- baseline invalidated, re-arming once the path settles\n\n");
+            }
             if (!driftBaseOK) {
                 if (sec >= 8 && settled) {
                     driftSum += driftMs;
@@ -4186,16 +4245,25 @@ int main(int argc, char** argv) {
                     if (sec >= 15 && driftN >= 4) {
                         driftBase = driftSum / (double)driftN;
                         driftBaseOK = true;
-                        tlog("\n[twinspeak] drift warden : baseline calibrated at %+.1f ms (inter-speaker offset,\n"
-                             "                            your delay calibration included). Corrections fire when the drift\n"
-                             "                            leaves it by >= %.0f ms for %u s; the health line's 'err' column is\n"
-                             "                            that distance live. A flat drift column with audible drift = the\n"
-                             "                            offset lives BELOW the USB packetizer (device silicon).\n\n",
-                             driftBase, g_cfg.driftCorrectMs, kWardenStreakNeeded);
+                        if (driftRecal)
+                            tlog("\n[twinspeak] drift warden : baseline RE-ARMED at %+.1f ms after reopen (the boot baseline\n"
+                                 "                            was stale against the reopened path). Corrections fire when the drift\n"
+                                 "                            leaves it by >= %.0f ms for %u s; 'err' is that distance live. If the\n"
+                                 "                            ears still hear drift on a FLAT drift column, the offset lives BELOW\n"
+                                 "                            the USB packetizer (device silicon) -- no host trigger exists.\n\n",
+                                 driftBase, g_cfg.driftCorrectMs, kWardenStreakNeeded);
+                        else
+                            tlog("\n[twinspeak] drift warden : baseline calibrated at %+.1f ms (inter-speaker offset,\n"
+                                 "                            your delay calibration included). Corrections fire when the drift\n"
+                                 "                            leaves it by >= %.0f ms for %u s; the health line's 'err' column is\n"
+                                 "                            that distance live. A flat drift column with audible drift = the\n"
+                                 "                            offset lives BELOW the USB packetizer (device silicon).\n\n",
+                                 driftBase, g_cfg.driftCorrectMs, kWardenStreakNeeded);
+                        driftRecal = false;
                     }
                 }
             } else if (g_cfg.driftGuard && settled
-                       && nowMs - wardenLastMs >= kWardenMinIntervalMs) {
+                       && nowMs - wardenLastMs >= g_cfg.driftIntervalMs) {
                 const double err = driftMs - driftBase;
                 if (err >= g_cfg.driftCorrectMs || err <= -g_cfg.driftCorrectMs) {
                     ++wardenStreak;
