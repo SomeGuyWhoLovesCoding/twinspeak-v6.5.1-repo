@@ -1,5 +1,23 @@
 // ============================================================================
-//  twinspeak v6.5.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.12 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.12 (field report: "when watching a movie, I noticed that the center
+//          speaker and main speaker eventually start delaying again", with
+//          drift_interval_ms = 2000 in the ini -- BELOW the clamp floor, so
+//          it silently ran at 5000. Two changes:
+//            TIGHTER RESYNC -- the drift_interval_ms clamp floor drops
+//            5000 -> 2000 ms, so the ini's 2000 is now honored. The
+//            warden's ledger is frame arithmetic on the play boundaries,
+//            not the noisy per-second ppm meter, so a 2 s evaluation
+//            spacing costs nothing in accuracy: worst case to the first
+//            re-pin drops from ~15 s (3 streak windows x 5 s) to ~6 s.
+//            DEEP RESYNC (deep_resync_min, default 0 = off) -- the S5's
+//            below-packetizer layer (endpoint FIFO + amp silicon) can
+//            deepen silently over a long session: the drift ledger stays
+//            pinned while the center audibly lags again. No host meter
+//            sees that layer; a scheduled fresh reopen of the center leg
+//            is the one reset that re-primes it. Opt-in for long movie
+//            sessions.)
 //
 //  v6.5.11 (field report: "another synthetic buzz (probably from an
 //          interrupt at 100% cpu) that delays the center speakers ... add
@@ -31,7 +49,8 @@
 //  v6.5.10 (field directive: "have it resync after five seconds to ensure
 //          the best possible stability" -- the whole warden resync chain now
 //          runs on a five-second clock. Correction spacing defaults to
-//          5000 ms -- the tightest the drift_interval_ms clamp allows, so a
+//          5000 ms -- the default resync clock (the v6.5.12 clamp floor is
+//          2000 ms), so a
 //          ramping drift error can never sit uncorrected longer than the
 //          3 s streak + one 5 s interval. The post-reopen settle gate drops
 //          10 s -> 5 s, so the baseline re-arm completes ~9 s after a
@@ -1005,6 +1024,12 @@ struct Config {
     // latency-critical playback; the price is each correction being an
     // audible skip/stutter of up to drift_correct_ms.
     unsigned    driftIntervalMs = 5000;   // v6.5.10: the five-second resync (was 30000)
+    // v6.5.12: scheduled fresh reopen of the CENTER leg (minutes; 0 = off).
+    // The S5's below-packetizer FIFO can deepen silently over a long
+    // session -- the drift ledger stays pinned while the center audibly
+    // lags again. No host meter sees that layer; a scheduled reopen is
+    // the one reset that re-primes it (brief gap, warden re-arms ~9 s).
+    unsigned    deepResyncMin   = 0;
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
@@ -2888,7 +2913,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.12 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3110,8 +3135,9 @@ static void writeTemplate(const char* path) {
         "\n"
         "; drift_interval_ms (v6.5.8, default retuned in v6.5.10): minimum\n"
         "; spacing between warden corrections (the RESYNC interval). Default\n"
-        "; 5000 = the five-second resync -- the tightest pin the clamp allows\n"
-        "; (range 5000..60000). Between corrections the drift error can keep\n"
+        "; 5000 = the five-second resync. Since v6.5.12 the clamp floor is\n"
+        "; 2000 (range 2000..60000), so a long session can chase drift on a\n"
+        "; 2 s clock. Between corrections the drift error can keep\n"
         "; ramping, so latency-critical playback (rhythm games) wants this as\n"
         "; tight as tolerable: each correction is a small audible skip of up\n"
         "; to drift_correct_ms, so tighter spacing = more frequent, smaller\n"
@@ -3130,6 +3156,16 @@ static void writeTemplate(const char* path) {
         "; resync'), and starvation lasting 3 consecutive seconds reopens the\n"
         "; leg fresh -- which also resets whatever the device's own silicon\n"
         "; accumulated during the storm.\n"
+        "\n"
+        "; DEEP RESYNC (v6.5.12, optional): the S5's below-packetizer layer\n"
+        "; (endpoint FIFO + amp silicon) can deepen silently over a long\n"
+        "; session -- the drift ledger stays pinned while the center audibly\n"
+        "; lags again. No host meter can see that layer; a scheduled fresh\n"
+        "; reopen of the center leg re-primes it. Each resync is a brief\n"
+        "; center gap and the warden re-arms ~9 s later; your delay1_ms\n"
+        "; calibration holds across it. 0 = off (default); try 30 for long\n"
+        "; movie sessions.\n"
+        "deep_resync_min = 0\n"
         "\n"
         "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
         "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
@@ -3238,6 +3274,7 @@ static bool loadIni(const char* path) {
         else if (key == "drift_guard")      g_cfg.driftGuard     = !isOff(val);  // v6.4
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
+        else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
         else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
     }
     fclose(f);
@@ -3253,8 +3290,10 @@ static bool loadIni(const char* path) {
     if (g_cfg.delay2Ms > 1000.0f) g_cfg.delay2Ms = 1000.0f;
     if (g_cfg.ring1Ms >= 0.0f) g_cfg.ring1Ms = clampMs(g_cfg.ring1Ms);
     if (g_cfg.ring2Ms >= 0.0f) g_cfg.ring2Ms = clampMs(g_cfg.ring2Ms);
-    if (g_cfg.driftIntervalMs < 5000)  g_cfg.driftIntervalMs = 5000;
+    if (g_cfg.driftIntervalMs < 2000)  g_cfg.driftIntervalMs = 2000;   // v6.5.12: was 5000
     if (g_cfg.driftIntervalMs > 60000) g_cfg.driftIntervalMs = 60000;
+    if (g_cfg.deepResyncMin > 0 && g_cfg.deepResyncMin < 5) g_cfg.deepResyncMin = 5;
+    if (g_cfg.deepResyncMin > 1440) g_cfg.deepResyncMin = 1440;
     // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
     // kernel-streaming pin; anything else stays WASAPI.
     for (int i = 0; i < 2; ++i) {
@@ -3983,7 +4022,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.11        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.12        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4171,6 +4210,7 @@ int main(int argc, char** argv) {
     int hintStreak = 0;
     long prevDom = 0;
     unsigned stallSec[2] = { 0, 0 };   // v6.5.11: consecutive starved seconds per leg
+    unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
     while (g_run.load()) {
         Sleep(1000);
         ++sec;
@@ -4346,6 +4386,33 @@ int main(int argc, char** argv) {
                          i + 1, stallSec[i]);
                     stallSec[i] = 0;
                     tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2);
+                }
+            }
+        }
+        // ---------------- v6.5.12 DEEP RESYNC (optional, deep_resync_min) --
+        // The S5's below-packetizer layer (endpoint FIFO + amp DSP silicon)
+        // can deepen silently over a long session: the drift ledger stays
+        // pinned (host paths stay equal) while the center audibly lags
+        // again. No host meter sees that layer -- the devbuf line reads the
+        // HOST side of the packetizer -- so the only reset that re-primes
+        // it is a fresh reopen of the leg (the stall resync's deep path,
+        // but on a schedule instead of on starvation evidence). Gated on
+        // the baseline being armed and the suspend park; the reopen sets
+        // the usual baseline-invalidation, so the warden re-arms ~9 s
+        // later and the delay calibration carries across untouched.
+        if (g_cfg.deepResyncMin && driftBaseOK
+            && !g_powerPark.load(std::memory_order_relaxed)) {
+            if (deepLastMs == 0)
+                deepLastMs = nowMs;
+            else if (nowMs - deepLastMs >= (unsigned long long)g_cfg.deepResyncMin * 60000ULL) {
+                deepLastMs = nowMs;
+                if (nowMs - g_leg[1].lastReopenMs > 10000
+                    && nowMs - g_leg[0].lastReopenMs > 10000) {
+                    tlog("[twinspeak] deep resync  : scheduled center-leg reopen (%u min) -- re-priming the\n"
+                         "                            device's below-packetizer FIFO; a brief center gap is\n"
+                         "                            expected, the warden re-arms ~9 s later\n",
+                         g_cfg.deepResyncMin);
+                    tryRestartLeg(1, &ctx, periodMs2);
                 }
             }
         }
