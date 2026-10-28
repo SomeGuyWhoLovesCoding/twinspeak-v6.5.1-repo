@@ -1,5 +1,25 @@
 // ============================================================================
-//  twinspeak v6.5.12 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.13 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.13 (field report: "sometimes I eventually get this reverberated
+//          sawing sound that mixes in with the audio" -- the KS looped
+//          WaveRT buffer had an unrecoverable lap-loss mode. The pacing
+//          thread integrates the play register by residue deltas gated at
+//          one full loop (d <= loopBytes always accepts); a deschedule
+//          longer than one lap silently loses k whole laps, the believed
+//          play position falls k loops behind, and the pacing sleeps on a
+//          lead that no longer exists -- the DAC circles the entire loop
+//          re-reading stale audio (the sawing) while heartbeats, und, the
+//          ledger and devbuf all stay clean. v6.5.13 LAPSE GUARD: the
+//          DAC's advance over each poll gap is wall-exact (QPC elapsed x
+//          rate); the residue advance is mod-loop. Any disagreement
+//          beyond tolerance -- or any gap of one lap or more -- re-pins
+//          the write cursor to play+lead and re-primes the lead region
+//          with the last played block (the ASIO replay convention;
+//          silence before the first block): a bit-exact skip of the lost
+//          window, logged as 'KS lapse' and counted in the devbuf line.
+//          A side effect: KS legs now also self-heal cleanly across
+//          system suspend.)
 //
 //  v6.5.12 (field report: "when watching a movie, I noticed that the center
 //          speaker and main speaker eventually start delaying again", with
@@ -1249,6 +1269,11 @@ struct KsOut {
     bool          havePos     = false;
     unsigned long long posGlitch = 0;  // implausible register reads ignored
     unsigned long long wrote     = 0;  // frames handed to the DAC (diagnostics)
+    // v6.5.13 lapse guard: wall-clock pacing bookkeeping (ksThread-private)
+    // and the number of play-register lap losses re-pinned since open.
+    LARGE_INTEGER   lastQpc  = {};
+    bool            qpcArmed = false;
+    std::atomic<unsigned long long> lapses{0};
     // v6.5.9: the LIVE write-minus-play lead (frames queued ahead of the DAC's
     // play cursor), stored by ksThread every pacing cycle -- the health loop
     // prints it in ms as the measured device buffering of a KS leg.
@@ -2831,6 +2856,12 @@ static DWORD WINAPI ksThread(LPVOID p) {
     const unsigned periodFr = K.periodFrames;
     const unsigned leadFr   = K.leadFrames;
 
+    // v6.5.13 lapse guard: the DAC advances on WALL time; this thread
+    // advances on its own poll cadence. QPC is the wall-clock reference.
+    LARGE_INTEGER qpcFreq = {};
+    QueryPerformanceFrequency(&qpcFreq);
+    unsigned long long lastLapseLogMs = 0;   // log rate limit
+
     while (g_run.load() && K.active) {
         // ---- read + integrate the play position (bytes inside the loop) ----
         ULONG raw = 0;
@@ -2838,6 +2869,81 @@ static DWORD WINAPI ksThread(LPVOID p) {
         if (K.posReg) { raw = *K.posReg; ok = true; }
         else          { ok = ksReadPosIoctl(K.pin, &raw); }
         if (ok) {
+            // ---- v6.5.13 LAPSE GUARD ------------------------------------
+            // The residue integration below can only see advances MOD the
+            // loop: a poll gap of one lap or more (a deschedule under an
+            // interrupt storm, system suspend) silently loses k whole laps,
+            // the believed play position falls k loops behind, and the
+            // pacing sleeps on a lead that no longer exists -- the DAC
+            // circles the loop re-reading stale audio (the reverberated
+            // sawing) with heartbeats, und, the ledger and devbuf all
+            // clean. Detection: the DAC's true advance over the gap is
+            // wall-exact (elapsed x rate); the residue advance is mod-loop.
+            // Any lap-sized gap, or any residue advance disagreeing with
+            // the wall expectation beyond a tolerance, means laps were
+            // lost: re-pin the write cursor to play+lead and re-prime the
+            // lead region (replay convention) -- a bit-exact skip of the
+            // lost window.
+            LARGE_INTEGER qn;
+            QueryPerformanceCounter(&qn);
+            double elapsed = 0.0;
+            if (K.qpcArmed && qpcFreq.QuadPart)
+                elapsed = (double)(qn.QuadPart - K.lastQpc.QuadPart)
+                        / (double)qpcFreq.QuadPart;
+            K.lastQpc  = qn;
+            K.qpcArmed = true;
+            if (K.loopFrames && qpcFreq.QuadPart) {
+                const long long expectedFr = (long long)(elapsed * (double)kSampleRate);
+                const ULONG     pbGuard    = raw - raw % (ULONG)K.frameBytes;
+                long long obsFr = ((long long)pbGuard - (long long)K.lastPosBytes)
+                                / (long long)K.frameBytes;
+                if (obsFr < 0) obsFr += (long long)K.loopFrames;   // residue wrap
+                const long long tolFr = (long long)2 * periodFr + 96;
+                const bool lapLoss    = expectedFr >= (long long)K.loopFrames;
+                const bool residueOdd = obsFr > expectedFr + tolFr
+                                     || obsFr + tolFr < expectedFr;
+                if (lapLoss || residueOdd) {
+                    const unsigned long long laps = lapLoss
+                        ? (unsigned long long)(expectedFr / (long long)K.loopFrames) : 1;
+                    const size_t playOffFr   = (size_t)(pbGuard / K.frameBytes) % K.loopFrames;
+                    const size_t curWriteOff = (size_t)(K.writeFrames % K.loopFrames);
+                    const size_t offDelta    = (playOffFr >= curWriteOff)
+                        ? playOffFr - curWriteOff
+                        : K.loopFrames - (curWriteOff - playOffFr);
+                    K.writeFrames += offDelta;   // write cursor -> the DAC's true position
+                    // re-prime the lead region [play, play + lead): the ASIO
+                    // replay convention (the last played block, tiled), or
+                    // silence before the first real block ever played.
+                    for (size_t f = 0; f < leadFr; ) {
+                        const size_t chunk = (leadFr - f < periodFr) ? (leadFr - f) : periodFr;
+                        if (L.haveLast && L.lastN) {
+                            for (size_t j = 0; j < chunk; ++j) {
+                                const float* src = L.lastBlock.data()
+                                                 + (((f + j) % L.lastN) * L.outCh);
+                                memcpy(fill + j * L.outCh, src, L.outCh * sizeof(float));
+                            }
+                        } else {
+                            memset(fill, 0, (size_t)chunk * L.outCh * sizeof(float));
+                        }
+                        ksConvertTo(K, fill, conv, chunk);
+                        ksWriteLoop(K, conv, (size_t)chunk * K.frameBytes);
+                        K.writeFrames += chunk;
+                        f += chunk;
+                    }
+                    K.playFrames   = K.writeFrames - leadFr;   // trusted lead restored
+                    K.lastPosBytes = pbGuard;
+                    K.lapses.fetch_add(1, std::memory_order_relaxed);
+                    const unsigned long long lapseMs = GetTickCount64();
+                    if (lapseMs - lastLapseLogMs >= 1000) {
+                        lastLapseLogMs = lapseMs;
+                        tlog("[twinspeak] leg%d KS lapse  : %llu loop lap(s) of play-position history lost in a\n"
+                             "                            %.1f ms pacing stall -- the DAC was re-reading stale loop audio\n"
+                             "                            (the reverberated sawing); write cursor re-pinned to play+lead,\n"
+                             "                            lead region re-primed (%u fr, replay convention) -- bit-exact skip\n",
+                             idx + 1, laps, elapsed * 1000.0, leadFr);
+                    }
+                }
+            }
             const ULONG pb = raw % (ULONG)K.loopBytes;
             if (K.havePos) {
                 ULONG d = pb;
@@ -2913,7 +3019,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.12 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.13 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3156,6 +3262,16 @@ static void writeTemplate(const char* path) {
         "; resync'), and starvation lasting 3 consecutive seconds reopens the\n"
         "; leg fresh -- which also resets whatever the device's own silicon\n"
         "; accumulated during the storm.\n"
+        "\n"
+        "; KS LAPSE GUARD (v6.5.13, always on): if the KS pacing thread is\n"
+        "; ever descheduled past one full WaveRT loop lap, the play\n"
+        "; register's residue silently loses laps and the DAC circles the\n"
+        "; loop re-reading stale audio -- a reverberated sawing mixed into\n"
+        "; the program, invisible to every other meter. The guard cross-\n"
+        "; checks the DAC's wall-exact advance against the register residue\n"
+        "; on every 500 us poll and re-pins the write cursor to play+lead on\n"
+        "; any loss (bit-exact skip, logged as 'KS lapse', counted in the\n"
+        "; devbuf line). KS legs also self-heal cleanly across suspend now.\n"
         "\n"
         "; DEEP RESYNC (v6.5.12, optional): the S5's below-packetizer layer\n"
         "; (endpoint FIFO + amp silicon) can deepen silently over a long\n"
@@ -4022,7 +4138,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.12        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.13        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4611,6 +4727,11 @@ int main(int argc, char** argv) {
                  padMs[0], padHow[0], g_leg[0].out.count() * 1000.0 / kSampleRate, burstMs, path1,
                  padMs[1], padHow[1], g_leg[1].out.count() * 1000.0 / kSampleRate, burstMs, path2,
                  path1 - path2);
+            const unsigned long long laps0 = g_leg[0].ks.lapses.load(std::memory_order_relaxed);
+            const unsigned long long laps1 = g_leg[1].ks.lapses.load(std::memory_order_relaxed);
+            if (laps0 || laps1)
+                tlog("                            KS lapse guard: %llu / %llu write-cursor re-pin(s) since boot\n",
+                     laps0, laps1);
         }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
         tlog(g_logToFile
