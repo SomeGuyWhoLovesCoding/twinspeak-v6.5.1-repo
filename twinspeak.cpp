@@ -1,5 +1,43 @@
 // ============================================================================
-//  twinspeak v6.5.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.11 (field report: "another synthetic buzz (probably from an
+//          interrupt at 100% cpu) that delays the center speakers ... add
+//          functionality that has it recover from that." -- the buzz is the
+//          known shortfall path: a starved device thread finds the ring
+//          empty and replayFill loops the last fragment (the fragment-loop
+//          buzz). What was MISSING is the AFTERMATH: while the device
+//          thread starves, the pump keeps feeding its ring, so the stalled
+//          leg accumulates stale backlog above its target anchor and its
+//          stream position falls behind the other leg -- the center arrives
+//          late long after the buzz stops. Two-stage recovery, always on:
+//            FAST PATH -- a leg with a shortfall (und) in the last second
+//            AND backlog above its anchor is resynced IMMEDIATELY: the
+//            stale excess is discarded (a bit-exact skip -- the warden's
+//            own operation, but per-leg, on first evidence, no 3 s streak,
+//            no interval wait). The leg resumes at the freshest data the
+//            moment the storm ends.
+//            DEEP PATH -- starvation lasting 3 consecutive seconds reopens
+//            the leg fresh (the watchdog's own mechanism): that also resets
+//            whatever the device-side silicon accumulated during the storm
+//            -- which matters on the S5, whose below-packetizer FIFO "is
+//            running something we have yet to completely uncover".
+//          Gated on the drift baseline being armed (boot/prefill and the
+//          post-reopen transient never fire it) and the power-park state.
+//          The fast path is capped at 100 ms per event; the deep path
+//          respects the 10 s per-leg reopen spacing. Zero sample-path
+//          deltas: the audio crossing the buffer switch is unchanged.)
+//
+//  v6.5.10 (field directive: "have it resync after five seconds to ensure
+//          the best possible stability" -- the whole warden resync chain now
+//          runs on a five-second clock. Correction spacing defaults to
+//          5000 ms -- the tightest the drift_interval_ms clamp allows, so a
+//          ramping drift error can never sit uncorrected longer than the
+//          3 s streak + one 5 s interval. The post-reopen settle gate drops
+//          10 s -> 5 s, so the baseline re-arm completes ~9 s after a
+//          reopen (5 s settle + a 4-sample average) instead of ~14 s, and
+//          boot calibration lands at ~9 s instead of ~15 s. Zero sample-
+//          path deltas; corrections remain bit-exact skips/in-place pads.)
 //
 //  v6.5.9 (field directive: "Read the actual per-leg device buffering at
 //          runtime." -- the align line's est path is arithmetic on CONFIGURED
@@ -966,7 +1004,7 @@ struct Config {
     // kWardenMinIntervalMs = 30000. Lower it for tighter pinning on
     // latency-critical playback; the price is each correction being an
     // audible skip/stutter of up to drift_correct_ms.
-    unsigned    driftIntervalMs = 30000;
+    unsigned    driftIntervalMs = 5000;   // v6.5.10: the five-second resync (was 30000)
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
@@ -2850,7 +2888,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3048,12 +3086,13 @@ static void writeTemplate(const char* path) {
         "; offset IS the alignment your ear asked for, not a fault. The 'err'\n"
         "; column beside it is the distance from the calibrated baseline --\n"
         "; the number the warden acts on; err ~ +0.0 means the path is pinned.\n"
-        "; For ~15 s after boot the warden\n"
+        "; For ~9 s after boot the warden\n"
         "; CALIBRATES: it averages the settled drift into a baseline (your\n"
         "; delay1_ms/delay2_ms calibration is inside that number). After that,\n"
         "; a drift that leaves the baseline by >= drift_correct_ms (default 10)\n"
-        "; for 3 consecutive seconds is CORRECTED automatically, at most once\n"
-        "; per 30 s: the late leg's ring gives back its excess (a bit-exact\n"
+        "; for 3 consecutive seconds is CORRECTED automatically (a RESYNC), at\n"
+        "; most once per drift_interval_ms (default 5000): the late leg's ring\n"
+        "; gives back its excess (a bit-exact\n"
         "; skip -- the same operation as the clock rule above) and the early\n"
         "; leg is held (its last buffer replays in place until the depth\n"
         "; returns). No sample value is ever touched. Two honest limits:\n"
@@ -3069,15 +3108,28 @@ static void writeTemplate(const char* path) {
         "drift_guard = on\n"
         "drift_correct_ms = 10\n"
         "\n"
-        "; drift_interval_ms (v6.5.8): minimum spacing between warden corrections\n"
-        "; (default 30000, range 5000..60000 -- the old hardcoded value). Between\n"
-        "; corrections the drift error can keep ramping, and latency-critical\n"
-        "; playback (rhythm games) wants a tighter pin: e.g. 10000 trades more\n"
-        "; frequent small skips for a smaller worst-case offset. Also new in\n"
-        "; v6.5.8: any device reopen (sleep/wake, USB re-enumeration) now\n"
-        "; invalidates the drift baseline and re-arms it once the path settles --\n"
-        "; a boot-time-only baseline went stale against exactly those events.\n"
-        "drift_interval_ms = 30000\n"
+        "; drift_interval_ms (v6.5.8, default retuned in v6.5.10): minimum\n"
+        "; spacing between warden corrections (the RESYNC interval). Default\n"
+        "; 5000 = the five-second resync -- the tightest pin the clamp allows\n"
+        "; (range 5000..60000). Between corrections the drift error can keep\n"
+        "; ramping, so latency-critical playback (rhythm games) wants this as\n"
+        "; tight as tolerable: each correction is a small audible skip of up\n"
+        "; to drift_correct_ms, so tighter spacing = more frequent, smaller\n"
+        "; corrections. Raise it only if the skips ever bother you. Also (in\n"
+        "; v6.5.8): any device reopen (sleep/wake, USB re-enumeration) now\n"
+        "; invalidates the drift baseline and re-arms it once the path settles\n"
+        "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
+        "; baseline went stale against exactly those events.\n"
+        "drift_interval_ms = 5000\n"
+        "\n"
+        "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
+        "; thread starves (an interrupt storm, a 100%% CPU hog), the shortfall\n"
+        "; path masks it with the fragment-loop buzz and the leg falls behind.\n"
+        "; The health loop recovers both ways: stale backlog above the leg's\n"
+        "; anchor is discarded immediately (bit-exact skip, logged as 'stall\n"
+        "; resync'), and starvation lasting 3 consecutive seconds reopens the\n"
+        "; leg fresh -- which also resets whatever the device's own silicon\n"
+        "; accumulated during the storm.\n"
         "\n"
         "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
         "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
@@ -3931,7 +3983,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.9         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.11        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -3954,7 +4006,7 @@ int main(int argc, char** argv) {
            "                            offset (no clock involved -- pure frame arithmetic; your delay1_ms/delay2_ms\n"
            "                            is inside it -- at delay1_ms = 60 it reads about -65, and that IS the\n"
            "                            alignment, not a fault). The baseline (your delay calibration included) is\n"
-           "                            averaged ~8-15 s after boot; auto re-pin when\n"
+           "                            averaged ~5-9 s after boot; auto re-pin (resync) when\n"
            "                            |drift - baseline| >= %.0f ms for 3 s: the late leg's ring gives back its\n"
            "                            excess (bit-exact skip), the early leg replays in place. The health line's\n"
            "                            'err' column is the live distance from that baseline (~0.0 = pinned). The\n"
@@ -4118,6 +4170,7 @@ int main(int argc, char** argv) {
     unsigned sec = 0;
     int hintStreak = 0;
     long prevDom = 0;
+    unsigned stallSec[2] = { 0, 0 };   // v6.5.11: consecutive starved seconds per leg
     while (g_run.load()) {
         Sleep(1000);
         ++sec;
@@ -4249,23 +4302,71 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // ---------------- v6.5.11 STALL RESYNC ----------------
+        // A starved device thread (interrupt storm, a 100% CPU hog) trips
+        // the shortfall path -- replayFill loops the last fragment (the
+        // synthetic buzz) -- and the leg ends up BEHIND: while it starved,
+        // the pump kept feeding its ring, so stale backlog piled up above
+        // the target anchor and the stream position slipped. Recovery:
+        //   FAST: und this second + backlog above the anchor -> discard the
+        //     excess NOW (bit-exact skip; the warden's own operation, but
+        //     per-leg, on first evidence, no streak/interval wait).
+        //   DEEP: starvation 3 seconds running -> reopen the leg fresh
+        //     (resets the device-side FIFO state the storm disturbed --
+        //     exactly the S5's below-packetizer mystery layer).
+        // Gated on the drift baseline being armed (no boot/prefill or
+        // post-reopen transients) and the suspend park. Capped at 100 ms
+        // per discard; the reopen path respects the 10 s per-leg spacing.
+        if (driftBaseOK && !g_powerPark.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < 2; ++i) {
+                Leg& SLeg = g_leg[i];
+                const unsigned long long undPrev = (i == 0) ? u00 : u10;
+                const unsigned long long undNow =
+                    SLeg.und.load(std::memory_order_relaxed);
+                const bool starved = undNow > undPrev;
+                stallSec[i] = starved ? stallSec[i] + 1 : 0;
+                if (!starved) continue;
+                // FAST PATH: immediate backlog resync (>= 1 ms of excess)
+                const long long dpt = (long long)SLeg.out.count()
+                                    - (long long)SLeg.targetFrames;
+                if (dpt >= 48) {
+                    size_t x = (dpt > (long long)kWardenMaxPadFrames)
+                             ? kWardenMaxPadFrames : (size_t)dpt;
+                    SLeg.out.discardOldest(x);
+                    tlog("[twinspeak] stall resync : leg%d starved (und +%llu this second) -- discarded\n"
+                         "                            %llu fr (%.1f ms) of stale backlog above the anchor;\n"
+                         "                            the leg resumes at the freshest data (no warden wait)\n",
+                         i + 1, (unsigned long long)(undNow - undPrev),
+                         (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate);
+                }
+                // DEEP PATH: sustained starvation -> fresh reopen
+                if (stallSec[i] >= 3 && nowMs - SLeg.lastReopenMs > 10000) {
+                    tlog("[twinspeak] stall resync : leg%d starved %u s running -- reopening fresh\n"
+                         "                            (also resets the device-side FIFO the storm disturbed)\n",
+                         i + 1, stallSec[i]);
+                    stallSec[i] = 0;
+                    tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2);
+                }
+            }
+        }
         // ---------------- v6.4 DRIFT WARDEN ----------------
-        // Baseline: the settled path's average drift (seconds 8..15, both
-        // heartbeats fresh, no reopen inside 10 s -- the baseline includes
+        // Baseline: the settled path's average drift (seconds 5..9, both
+        // heartbeats fresh, no reopen inside 5 s -- the baseline includes
         // the ini delay offsets, i.e. the user's own delay1_ms calibration).
         // Correction: |drift - baseline| >= drift_correct_ms held for 3
-        // consecutive windows, at most once per 30 s: the late leg's ring
+        // consecutive windows, at most once per drift_interval_ms (the
+        // v6.5.10 five-second resync default): the late leg's ring
         // discards its excess (bit-exact skip), the early leg is held (its
         // last buffer replays in place). Never fires on a dead/reopening leg.
         if (driftOK) {
-            const bool settled = (nowMs - g_leg[0].lastReopenMs > 10000)
-                              && (nowMs - g_leg[1].lastReopenMs > 10000)
+            const bool settled = (nowMs - g_leg[0].lastReopenMs > 5000)
+                              && (nowMs - g_leg[1].lastReopenMs > 5000)
                               && (nowMs - hbOutGet(0) < 5000)
                               && (nowMs - hbOutGet(1) < 5000);
             // v6.5.8: a reopen (watchdog leg/capture, power-guard resume) can
             // legitimately move the path's real latency afterwards -- the boot
             // baseline goes stale, so it is invalidated and re-armed once the
-            // path settles again (~14 s: 10 s settle + a 4-sample average).
+            // path settles again (~9 s: 5 s settle + a 4-sample average).
             if (g_driftRecalReq.exchange(false) && driftBaseOK) {
                 driftBaseOK = false;
                 driftSum = 0.0;  driftN = 0;
@@ -4273,10 +4374,10 @@ int main(int argc, char** argv) {
                 tlog("\n[twinspeak] drift warden : device reopen -- baseline invalidated, re-arming once the path settles\n\n");
             }
             if (!driftBaseOK) {
-                if (sec >= 8 && settled) {
+                if (sec >= 5 && settled) {
                     driftSum += driftMs;
                     ++driftN;
-                    if (sec >= 15 && driftN >= 4) {
+                    if (sec >= 9 && driftN >= 4) {
                         driftBase = driftSum / (double)driftN;
                         driftBaseOK = true;
                         if (driftRecal)
